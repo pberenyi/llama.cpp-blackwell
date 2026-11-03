@@ -9,6 +9,7 @@
 #include "ggml-cuda/arange.cuh"
 #include "ggml-cuda/argmax.cuh"
 #include "ggml-cuda/argsort.cuh"
+#include "ggml-cuda/gumbel.cuh"
 #include "ggml-cuda/binbcast.cuh"
 #include "ggml-cuda/clamp.cuh"
 #include "ggml-cuda/col2im-1d.cuh"
@@ -2363,6 +2364,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_COUNT_EQUAL:
             ggml_cuda_count_equal(ctx, dst);
+            break;
+        case GGML_OP_ADD_GUMBEL:
+            ggml_cuda_op_add_gumbel(ctx, dst);
             break;
         case GGML_OP_REPEAT:
             ggml_cuda_op_repeat(ctx, dst);
@@ -5992,6 +5996,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_ARGMAX:
         case GGML_OP_COUNT_EQUAL:
             return true;
+        case GGML_OP_ADD_GUMBEL:
+            // (rows map to grid.y of the apply kernel)
+            return op->src[0]->type == GGML_TYPE_F32 && op->src[0]->nb[0] == sizeof(float) && ggml_is_contiguous(op->src[1]) &&
+                op->src[0]->ne[1] <= 65535;
         case GGML_OP_REPEAT:
             {
                 // the CUDA REPEAT path only implements F32/F16; other types assert at runtime

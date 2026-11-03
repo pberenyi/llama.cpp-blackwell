@@ -606,6 +606,8 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_ADD_GUMBEL,
+
         GGML_OP_COUNT,
     };
 
@@ -1079,6 +1081,24 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_argmax(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
+
+    // Gumbel-max sampling on the device: add counter-based noise (the same values on every backend and in
+    // ggml_gumbel_noise) to the kept elements of each row of a, like top-k/top-p sampling:
+    //   out[i0, i1] = a[i0, i1] + t*ggml_gumbel_noise(seed, (uint32_t) (k + k_off + i1), ids[i0])  if i0 is kept, else -INFINITY
+    // a: F32 [n, m], ids: I32 or F32 (integer values, e.g. token ids) [n], p: I32 [6] = { seed, k, t, n_valid, top_k, top_p }
+    // (t and top_p as F32 bits). Only the first n_valid elements of a row can be kept (n_valid <= 0: all). top_k > 0 keeps
+    // the elements >= the top_k-th largest one (all of them if there are more than 128), and then, if top_p < 1, the
+    // smallest prefix of those (by value) whose softmax reaches top_p. t = 0: out = a.
+    // The argmax of a row of out is a sample of softmax(a/t) over the kept elements.
+    GGML_API struct ggml_tensor * ggml_add_gumbel(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * p,
+            int32_t               k_off);
+
+    // Gumbel noise -log(-log(u)) with u in (0, 1) from a hash of (seed, ctr, id), 52 random bits
+    GGML_API float ggml_gumbel_noise(uint32_t seed, uint64_t ctr, int32_t id);
 
     // count number of equal elements in a and b
     GGML_API struct ggml_tensor * ggml_count_equal(

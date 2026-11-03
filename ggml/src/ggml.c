@@ -1116,9 +1116,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "ADD_GUMBEL",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1232,9 +1234,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "add_gumbel(x,ids,p)",
 };
 
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2573,6 +2577,48 @@ struct ggml_tensor * ggml_argmax(
 
     result->op     = GGML_OP_ARGMAX;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_add_gumbel
+
+static inline uint64_t ggml_gumbel_mix64(uint64_t z) {
+    // splitmix64 finalizer
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+float ggml_gumbel_noise(uint32_t seed, uint64_t ctr, int32_t id) {
+    // keep in sync with ggml-cuda/gumbel.cu
+    const uint64_t key = ggml_gumbel_mix64(ggml_gumbel_mix64((uint64_t) seed + 0x9e3779b97f4a7c15ULL) ^ ctr);
+    const uint64_t r   = ggml_gumbel_mix64(key + ((uint64_t) (uint32_t) id + 1)*0x9e3779b97f4a7c15ULL);
+
+    const double u = ((double) (r >> 12) + 0.5)*0x1p-52; // exact, in (0, 1)
+
+    return (float) -log(-log(u));
+}
+
+struct ggml_tensor * ggml_add_gumbel(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * p,
+        int32_t               k_off) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_matrix(a) && a->nb[0] == sizeof(float));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 || ids->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_vector(ids) && ggml_is_contiguous(ids) && ids->ne[0] == a->ne[0]);
+    GGML_ASSERT(p->type == GGML_TYPE_I32 && ggml_is_contiguous(p) && ggml_nelements(p) == 6);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, k_off);
+
+    result->op     = GGML_OP_ADD_GUMBEL;
+    result->src[0] = a;
+    result->src[1] = ids;
+    result->src[2] = p;
 
     return result;
 }

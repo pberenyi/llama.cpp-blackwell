@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <cfloat>
 #include <cmath>
+#include <vector>
 
 // ggml_compute_forward_dup
 
@@ -1703,6 +1704,131 @@ static void ggml_compute_forward_count_equal_i32(
         sum_thread += sums[ith_other];
     }
     *((int64_t *) dst->data) = sum_thread;
+}
+
+// ggml_compute_forward_add_gumbel
+
+// float -> uint32 with the same order (keep in sync with ggml-cuda/gumbel.cu)
+static inline uint32_t ggml_gumbel_key(float x) {
+    uint32_t b;
+    memcpy(&b, &x, sizeof(b));
+    return b ^ ((b >> 31) ? 0xFFFFFFFFu : 0x80000000u);
+}
+
+void ggml_compute_forward_add_gumbel(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+    const ggml_tensor * src1 = dst->src[1];
+    const ggml_tensor * src2 = dst->src[2];
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_I32);
+    GGML_ASSERT(src1->type == GGML_TYPE_I32 || src1->type == GGML_TYPE_F32);
+
+    if (params->ith != 0) {
+        return;
+    }
+
+    const int32_t * par = (const int32_t *) src2->data;
+
+    const uint32_t seed  = (uint32_t) par[0];
+    const uint32_t k     = (uint32_t) par[1];
+    const int32_t  top_k = par[4];
+    float t;
+    float top_p;
+    memcpy(&t,     &par[2], sizeof(float));
+    memcpy(&top_p, &par[5], sizeof(float));
+
+    const int32_t k_off = ggml_get_op_params_i32(dst, 0);
+
+    const int64_t n  = src0->ne[0];
+    const int64_t nr = src0->ne[1];
+    const int64_t nv = par[3] > 0 ? std::min<int64_t>(par[3], n) : n;
+
+    const int max_cand = 128; // keep in sync with ggml-cuda/gumbel.cu
+
+    std::vector<uint32_t> keys(nv);
+    std::vector<int64_t>  cand;
+
+    for (int64_t ir = 0; ir < nr; ++ir) {
+        const float * a = (const float *) ((const char *) src0->data + ir*src0->nb[1]);
+        float       * y = (float       *) ((char       *)  dst->data + ir* dst->nb[1]);
+
+        if (t == 0.0f) {
+            memcpy(y, a, n*sizeof(float));
+            continue;
+        }
+
+        // kept: all of [0, nv), or the elements up to (lkey, lidx) in the order (value desc, index asc)
+        bool     all  = true;
+        uint32_t lkey = 0;
+        int64_t  lidx = 0;
+
+        if (top_k > 0 && nv > 0) {
+            for (int64_t i = 0; i < nv; ++i) {
+                keys[i] = ggml_gumbel_key(a[i]);
+            }
+            const int64_t kk = std::min<int64_t>(top_k, nv);
+
+            std::vector<uint32_t> tmp(keys);
+            std::nth_element(tmp.begin(), tmp.begin() + (kk - 1), tmp.end(), std::greater<uint32_t>());
+            const uint32_t tau = tmp[kk - 1];
+
+            cand.clear();
+            for (int64_t i = 0; i < nv; ++i) {
+                if (keys[i] >= tau) {
+                    cand.push_back(i);
+                }
+            }
+
+            if ((int64_t) cand.size() <= max_cand) {
+                std::sort(cand.begin(), cand.end(), [&](int64_t x, int64_t z) {
+                    return keys[x] > keys[z] || (keys[x] == keys[z] && x < z);
+                });
+
+                size_t c = cand.size();
+                if (top_p < 1.0f) {
+                    std::vector<float> e(cand.size());
+                    float sum = 0.0f;
+                    for (size_t l = 0; l < cand.size(); ++l) {
+                        e[l] = (float) exp((double) a[cand[l]] - (double) a[cand[0]]);
+                        e[l] = e[l] < FLT_MIN ? 0.0f : e[l]; // as the GPU (flush to zero)
+                        sum += e[l];
+                    }
+                    const float lim = top_p*sum;
+                    float cum = 0.0f;
+                    for (size_t l = 0; l < cand.size(); ++l) {
+                        cum += e[l];
+                        if (cum >= lim) {
+                            c = l + 1;
+                            break;
+                        }
+                    }
+                }
+
+                all  = false;
+                lkey = keys[cand[c - 1]];
+                lidx = cand[c - 1];
+            }
+        }
+
+        const uint32_t kr = k + (uint32_t) k_off + (uint32_t) ir;
+
+        for (int64_t i = 0; i < n; ++i) {
+            bool keep = i < nv;
+            if (keep && !all) {
+                const uint32_t key = ggml_gumbel_key(a[i]);
+                keep = key > lkey || (key == lkey && i <= lidx);
+            }
+            if (!keep) {
+                y[i] = -INFINITY;
+                continue;
+            }
+            const int32_t id = src1->type == GGML_TYPE_I32 ? ((const int32_t *) src1->data)[i] : (int32_t) ((const float *) src1->data)[i];
+            y[i] = fmaf(t, ggml_gumbel_noise(seed, kr, id), a[i]);
+        }
+    }
 }
 
 void ggml_compute_forward_count_equal(

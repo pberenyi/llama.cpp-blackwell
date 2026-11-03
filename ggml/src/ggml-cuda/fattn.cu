@@ -1,6 +1,7 @@
 #include "common.cuh"
 #include "fattn-common.cuh"
 #include "fattn-mma-f16.cuh"
+#include "fattn-mma-q4i8.cuh"
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn.cuh"
@@ -168,6 +169,52 @@ bool ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(const int cc, const ggml_
 #endif // !defined(GGML_USE_MUSA)
 }
 
+bool ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(const int cc, const ggml_tensor * dst) {
+    const ggml_tensor * Q    = dst->src[0];
+    const ggml_tensor * K    = dst->src[1];
+    const ggml_tensor * V    = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    if (K->type != GGML_TYPE_Q4_0 || V->type != GGML_TYPE_Q4_0 || K->ne[0] != 256 || V->ne[0] != 256 || !cp_async_available(cc)) {
+        return false;
+    }
+
+    float max_bias = 0.0f;
+    float logit_softcap = 0.0f;
+    memcpy(&max_bias,      (const float *) dst->op_params + 1, sizeof(float));
+    memcpy(&logit_softcap, (const float *) dst->op_params + 2, sizeof(float));
+    if (logit_softcap != 0.0f) {
+        return false;
+    }
+
+    // Same condition as use_gqa_opt in ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2, guarantees ncols2 >= 2.
+    if (!mask || max_bias != 0.0f || K->ne[1] % FATTN_KQ_STRIDE != 0 || Q->ne[2] / K->ne[2] < 2) {
+        return false;
+    }
+    for (const ggml_tensor * t : {Q, mask}) {
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                return false;
+            }
+        }
+    }
+
+    // The raw K/V rows are copied in chunks of 16 bytes.
+    for (const ggml_tensor * t : {K, V}) {
+        if ((uintptr_t) t->data % 16 != 0 || t->view_offs % 16 != 0) {
+            return false;
+        }
+        for (size_t i = 1; i < GGML_MAX_DIMS; ++i) {
+            if (t->nb[i] % 16 != 0) {
+                return false;
+            }
+        }
+    }
+
+    // The sparse kernels read the F16 K/V buffers.
+    return !ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 1, 8) && !ggml_cuda_flash_attn_ext_mma_f16_shall_use_sparse(cc, dst, 8, 8);
+}
+
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -280,6 +327,23 @@ static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols2(ggml_backend_cuda_con
         }
     }
 
+    // Large batches with F16 or directly read q4_0 K/V are compute bound: use the largest ncols2 that divides the GQA ratio
+    //     so that no tensor core work is spent on padding heads (e.g. GQA 6 would waste 1/4 of it with ncols2 == 8).
+    //     Only tested on consumer Blackwell, where this is the fallback of the INT8 kernel in fattn-mma-q4i8.cu.
+    if constexpr (DKQ == 256 && DV == 256) {
+        const bool KV_f16 = K->type == GGML_TYPE_F16 && V->type == GGML_TYPE_F16;
+        if (use_gqa_opt && Q->ne[1] >= 64 && gqa_ratio % 8 != 0 && gqa_ratio % 2 == 0 &&
+                GGML_CUDA_CC_IS_NVIDIA(cc) && cc >= GGML_CUDA_CC_BLACKWELL && cc < GGML_CUDA_CC_RUBIN &&
+                (KV_f16 || ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(cc, dst))) {
+            if (gqa_ratio % 4 == 0) {
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 4>(ctx, dst);
+            } else {
+                ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 2>(ctx, dst);
+            }
+            return;
+        }
+    }
+
     if (use_gqa_opt && gqa_ratio > 4) {
         ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1<DKQ, DV, 8>(ctx, dst);
         return;
@@ -309,6 +373,14 @@ static void ggml_cuda_flash_attn_ext_mma_f16(ggml_backend_cuda_context & ctx, gg
     const ggml_tensor * K    = dst->src[1];
     const ggml_tensor * V    = dst->src[2];
     const ggml_tensor * mask = dst->src[3];
+
+    // Large batches with q4_0 or F16 K/V and head size 256: INT8 tensor cores for K*Q^T (sm_120 only).
+    // GGML_CUDA_FA_NO_Q4I8 disables it for A/B comparisons.
+    static const bool disable_q4i8 = getenv("GGML_CUDA_FA_NO_Q4I8") != nullptr;
+    if (!disable_q4i8 && ggml_cuda_flash_attn_ext_mma_q4i8_supported(ggml_cuda_get_device(), dst)) {
+        ggml_cuda_flash_attn_ext_mma_q4i8(ctx, dst);
+        return;
+    }
 
     switch (Q->ne[0]) {
         case 64:
@@ -664,6 +736,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                         !(gqa_ratio > 4 && (Q->ne[0] >= 256 || K->ne[1] >= 8192))) {
                     return BEST_FATTN_KERNEL_VEC;
                 }
+            } else if (Q->ne[1] <= 2 && ggml_cuda_flash_attn_ext_mma_f16_use_q4_0_KV(cc, dst)) {
+                // q4_0 K/V with GQA: the MMA kernel reads each K/V head once for all of its Q heads,
+                //     the vector kernel reads K/V once per Q head.
+                return BEST_FATTN_KERNEL_MMA_F16;
             } else {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     if (Q->ne[1] <= 2) {
@@ -759,6 +835,9 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 
     switch (kernel) {
         case BEST_FATTN_KERNEL_TILE:
+            need_f16_K = true;
+            need_f16_V = true;
+            break;
         case BEST_FATTN_KERNEL_MMA_F16:
             need_f16_K = true;
             need_f16_V = true;
