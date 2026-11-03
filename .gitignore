@@ -153,3 +153,10 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+Cmake*
+*.cmake
+*.exp
+/tools/ui
+.ninja*
+*.tcl
