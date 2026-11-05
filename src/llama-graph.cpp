@@ -396,8 +396,24 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_rs::set_input_replay(const llama_memory_recurrent_context * mctx_recr, const llama_ubatch * ubatch) {
+    if (rp_idx) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(rp_idx->buffer));
+        GGML_ASSERT(ggml_nelements(rp_idx) == mctx_recr->rs_replay_n_idx(ubatch->n_seqs, mctx_recr->get_rs_W()));
+        int32_t * data = (int32_t *) rp_idx->data;
+        mctx_recr->set_input_rs_replay(data, ubatch->n_seqs, ubatch->n_tokens / ubatch->n_seqs);
+    }
+}
+
+bool llm_graph_input_rs::can_reuse_replay(const llama_memory_recurrent_context * mctx_recr, const llama_ubatch & ubatch) const {
+    if ((rp_idx != nullptr) != mctx_recr->is_rs_replay()) {
+        return false;
+    }
+    return rp_idx == nullptr || rp_idx->ne[0] == mctx_recr->rs_replay_n_idx(ubatch.n_seqs, mctx_recr->get_rs_W());
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
+    set_input_replay(mctx, ubatch);
 
     const int64_t n_rs = mctx->get_n_rs();
 
@@ -425,6 +441,8 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+
+    res &= can_reuse_replay(mctx, params.ubatch);
 
     return res;
 }
@@ -1123,6 +1141,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
         mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
     }
 
+    inp_rs->set_input_replay(mctx->get_recr(), ubatch);
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1154,6 +1174,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_replay(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1168,6 +1189,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     if (inp_attn->self_kq_mask->buffer) {
         mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
     }
+
+    inp_rs->set_input_replay(mctx->get_recr(), ubatch);
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -1199,6 +1222,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_replay(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1225,6 +1249,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     if (inp_attn->self_kq_mask_swa && inp_attn->self_kq_mask_swa->buffer) {
         attn_ctx->get_swa()->set_input_kq_mask(inp_attn->self_kq_mask_swa, ubatch, cparams.causal_attn);
     }
+
+    inp_rs->set_input_replay(mctx->get_recr(), ubatch);
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -1270,6 +1296,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_replay(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -3884,6 +3911,8 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     const int64_t n_rs   = mctx_cur->get_n_rs();
     const int64_t n_seqs = ubatch.n_seqs;
 
+
+
     inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
     ggml_set_input(inp->s_copy);
     ggml_set_name(inp->s_copy, "rs_s_copy");
@@ -3893,6 +3922,30 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+
+    if (mctx_cur->is_rs_replay()) {
+        const int64_t Cap = mctx_cur->get_rs_Cap();
+        const int64_t W   = mctx_cur->get_rs_W();
+
+        // always the max size (n_seq_tokens = W) so the graph shape does not depend on the token count
+        inp->rp_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, mctx_cur->rs_replay_n_idx(n_seqs, W));
+        ggml_set_input(inp->rp_idx);
+        ggml_set_name(inp->rp_idx, "rs_replay_idx");
+
+        const size_t es = ggml_element_size(inp->rp_idx);
+        int64_t off = 0;
+        auto view = [&](int64_t n) {
+            ggml_tensor * t = ggml_view_1d(ctx0, inp->rp_idx, n, off*es);
+            off += n;
+            return t;
+        };
+        inp->rp_s_src    = view(n_seqs);
+        inp->rp_rep      = view(2*n_seqs);
+        inp->rp_ring_src = view(Cap*n_seqs);
+        inp->rp_s_dst    = view(n_seqs);
+        inp->rp_ring_dst = view(W*n_seqs);
+        inp->rp_extra    = view(n_rs - n_seqs);
+    }
 
     return inp;
 }

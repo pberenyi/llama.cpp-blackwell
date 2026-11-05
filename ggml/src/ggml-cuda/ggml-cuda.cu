@@ -2681,6 +2681,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_GATED_DELTA_NET:
             ggml_cuda_op_gated_delta_net(ctx, dst);
             break;
+        case GGML_OP_GATED_DELTA_NET_REPLAY:
+            ggml_cuda_op_gated_delta_net_replay_plain(ctx, dst);
+            break;
         case GGML_OP_DSV4_HC_COMB:
             ggml_cuda_op_dsv4_hc_comb(ctx, dst);
             break;
@@ -3943,6 +3946,336 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
     return false;
 }
 
+// ---------------------------------------------------------------------------------------------------------------
+// Qwen3.5-style gated-delta-net rollback-by-replay fusion (graph_optimize reorders the nodes so they become
+// adjacent and registers the allocation dependencies the fused kernel needs; graph_compute re-matches and fuses
+// them). The fused kernel reads the state/ring rows through the row-index tensors and writes the state and the
+// new ring rows straight into the caches, so the get_rows/set_rows nodes are skipped.
+// ---------------------------------------------------------------------------------------------------------------
+
+static const ggml_tensor * ggml_cuda_fusion_base(const ggml_tensor * t) {
+    return t->view_src ? t->view_src : t;
+}
+
+static bool ggml_cuda_fusion_ranges_overlap(const ggml_tensor * a, const ggml_tensor * b) {
+    if (a == nullptr || b == nullptr || a->data == nullptr || b->data == nullptr || ggml_is_empty(a) || ggml_is_empty(b)) {
+        return false;
+    }
+    const char * a0 = (const char *) a->data;
+    const char * a1 = a0 + ggml_nbytes(a);
+    const char * b0 = (const char *) b->data;
+    const char * b1 = b0 + ggml_nbytes(b);
+    return a0 < b1 && b0 < a1;
+}
+
+static int ggml_cuda_fusion_find_node(const ggml_cgraph * cgraph, const ggml_tensor * t, int lo, int hi) {
+    for (int k = std::max(lo, 0); k < std::min(hi, cgraph->n_nodes); ++k) {
+        if (cgraph->nodes[k] == t) {
+            return k;
+        }
+    }
+    return -1;
+}
+
+// move node `from` so that it ends up at index `to` (other nodes shift by one)
+static void ggml_cuda_fusion_move_node(ggml_cgraph * cgraph, int from, int to) {
+    ggml_tensor * n = cgraph->nodes[from];
+    if (from < to) {
+        for (int k = from; k < to; ++k) {
+            cgraph->nodes[k] = cgraph->nodes[k + 1];
+        }
+    } else {
+        for (int k = from; k > to; --k) {
+            cgraph->nodes[k] = cgraph->nodes[k - 1];
+        }
+    }
+    cgraph->nodes[to] = n;
+}
+
+static int ggml_cuda_fusion_use_count(const ggml_cgraph * cgraph, const ggml_tensor * t) {
+    const size_t pos = ggml_hash_find(&cgraph->visited_hash_set, t);
+    if (pos == GGML_HASHSET_FULL || !ggml_bitset_get(cgraph->visited_hash_set.used, pos)) {
+        return -1;
+    }
+    return cgraph->use_counts[pos];
+}
+
+// true if a node in [lo, hi) writes (non-empty) into memory that belongs to `base`
+static bool ggml_cuda_fusion_written_between(const ggml_cgraph * cgraph, const ggml_tensor * base, int lo, int hi) {
+    for (int k = lo; k < hi; ++k) {
+        const ggml_tensor * n = cgraph->nodes[k];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (ggml_cuda_fusion_base(n) == base) {
+            return true;
+        }
+        if ((n->op == GGML_OP_CPY || n->op == GGML_OP_SET_ROWS) && n->src[1] && ggml_cuda_fusion_base(n->src[1]) == base) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool ggml_cuda_gdn_is_l2norm(const ggml_cgraph * cgraph, const ggml_tensor * s, ggml_tensor ** n_out) {
+    if (s->op != GGML_OP_SCALE || s->type != GGML_TYPE_F32 || ggml_get_op_params_f32(s, 1) != 0.0f) {
+        return false;
+    }
+    ggml_tensor * n = s->src[0];
+    if (n->op != GGML_OP_RMS_NORM || n->type != GGML_TYPE_F32 || n->src[0]->type != GGML_TYPE_F32 ||
+        n->src[0]->nb[0] != sizeof(float) || n->src[0]->ne[0] != 128 || !ggml_is_contiguous(s) || !ggml_is_contiguous(n) ||
+        ggml_cuda_fusion_use_count(cgraph, n) != 1 || ggml_cuda_fusion_use_count(cgraph, s) != 1 ||
+        (n->flags & GGML_TENSOR_FLAG_OUTPUT) || (s->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    *n_out = n;
+    return true;
+}
+
+// ---- gated delta net with rollback by replay: l2norm(q), l2norm(k), [state and ring gathers], op, [scatters] ----
+// Full group (single sequence): [nq, sq, nk, sk, gs, rs, gr, rr, op, (views), set_rows state, (set_rows ring)] -> one
+// kernel that reads the state/ring rows and writes the state and the new ring rows straight into the caches.
+// l2 group: [nq, sq, nk, sk, op] -> the kernel normalizes q/k; gathers and scatters stay separate nodes.
+
+struct ggml_cuda_gdn_replay_match {
+    ggml_tensor * nq = nullptr, * sq = nullptr, * nk = nullptr, * sk = nullptr;
+    ggml_tensor * gs = nullptr, * rs = nullptr, * gr = nullptr, * rr = nullptr; // gathers (full group)
+    ggml_tensor * op = nullptr;
+    ggml_tensor * sr[2] = { nullptr, nullptr };                                  // scatters: state, ring (chain)
+    int last = -1;                                                              // index of the last scatter
+};
+
+static bool ggml_cuda_gdn_replay_is_gather(const ggml_cgraph * cgraph, ggml_tensor * t, int64_t n_idx, ggml_tensor ** g_out) {
+    if (t->op != GGML_OP_RESHAPE || t->src[0]->op != GGML_OP_GET_ROWS) {
+        return false;
+    }
+    ggml_tensor * g = t->src[0];
+    const ggml_tensor * rows = g->src[1];
+    if (g->type != GGML_TYPE_F32 || g->src[0]->type != GGML_TYPE_F32 || g->src[0]->nb[0] != sizeof(float) ||
+        g->src[0]->ne[2] != 1 || g->src[0]->ne[3] != 1 || !ggml_is_contiguous(g) || !ggml_is_contiguous(t) ||
+        g->ne[0] != g->src[0]->ne[0] || rows->type != GGML_TYPE_I32 || ggml_nelements(rows) != n_idx || !ggml_is_contiguous(rows) ||
+        ggml_cuda_fusion_use_count(cgraph, g) != 1 || ggml_cuda_fusion_use_count(cgraph, t) != 1 ||
+        (g->flags & GGML_TENSOR_FLAG_OUTPUT) || (t->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    *g_out = g;
+    return true;
+}
+
+// basic checks + l2 norms + gathers (does not look at the node order)
+static bool ggml_cuda_gdn_replay_check(const ggml_cgraph * cgraph, ggml_cuda_gdn_replay_match & m) {
+    const ggml_tensor * op = m.op;
+    if (op->type != GGML_TYPE_F32 || !ggml_cuda_gated_delta_net_replay_supported(op) || (op->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+        return false;
+    }
+    if (!ggml_cuda_gdn_is_l2norm(cgraph, op->src[0], &m.nq) || !ggml_cuda_gdn_is_l2norm(cgraph, op->src[1], &m.nk)) {
+        return false;
+    }
+    m.sq = op->src[0];
+    m.sk = op->src[1];
+    const ggml_tensor * rq = m.nq->src[0];
+    const ggml_tensor * rk = m.nk->src[0];
+    if (!ggml_are_same_shape(rq, rk) || !ggml_are_same_stride(rq, rk) || !ggml_are_same_shape(rq, m.sq) || rq->ne[3] != op->src[2]->ne[3]) {
+        return false;
+    }
+    m.gs = m.rs = m.gr = m.rr = nullptr;
+    const int64_t n_seqs = op->src[2]->ne[3];
+    if (n_seqs == 1 &&
+        ggml_cuda_gdn_replay_is_gather(cgraph, op->src[5], 1, &m.gs) &&
+        ggml_cuda_gdn_replay_is_gather(cgraph, op->src[6], op->src[6]->ne[1], &m.gr)) {
+        m.rs = op->src[5];
+        m.rr = op->src[6];
+    } else {
+        m.gs = m.gr = nullptr;
+    }
+    return true;
+}
+
+// the scatters of the op's state output and (chain) new ring rows, starting after node `oi` (views in between)
+static bool ggml_cuda_gdn_replay_scatters(const ggml_cgraph * cgraph, int oi, ggml_cuda_gdn_replay_match & m) {
+    const ggml_tensor * op = m.op;
+    const ggml_tensor * v  = op->src[2];
+    const int64_t S_v = v->ne[0], H = v->ne[1], n_tokens = v->ne[2], n_seqs = v->ne[3];
+    const int64_t D   = S_v * S_v * H;
+    const int64_t F   = op->src[6]->ne[0];
+    const bool chain  = n_tokens <= ggml_get_op_params_i32(op, 0);
+    const int  n_sr   = chain ? 2 : 1;
+    const size_t  off[2] = { (size_t) (S_v * H * n_tokens * n_seqs) * sizeof(float),
+                             (size_t) (S_v * H * n_tokens * n_seqs + D * n_seqs) * sizeof(float) };
+    const int64_t ne0[2] = { D, F };
+    const int64_t ne1[2] = { n_seqs, n_tokens * n_seqs };
+    int found = 0;
+    for (int j = oi + 1; j < cgraph->n_nodes && found < n_sr; ++j) {
+        ggml_tensor * n = cgraph->nodes[j];
+        if (ggml_cuda_is_view_or_noop(n)) {
+            continue;
+        }
+        if (n->op != GGML_OP_SET_ROWS) {
+            return false;
+        }
+        const ggml_tensor * src  = n->src[0];
+        const ggml_tensor * rows = n->src[1];
+        const ggml_tensor * dst  = n->src[2];
+        if (src->op != GGML_OP_VIEW || src->view_src != op || src->view_offs != off[found] || !ggml_is_contiguous(src) ||
+            src->ne[0] != ne0[found] || src->ne[1] != ne1[found] || ggml_cuda_fusion_use_count(cgraph, src) != 1 ||
+            rows->type != GGML_TYPE_I32 || ggml_nelements(rows) != ne1[found] || !ggml_is_contiguous(rows) ||
+            dst->type != GGML_TYPE_F32 || dst->data == nullptr || dst->ne[0] != ne0[found] || dst->nb[0] != sizeof(float) ||
+            dst->ne[2] != 1 || dst->ne[3] != 1 || (n->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+            return false;
+        }
+        m.sr[found++] = n;
+        m.last = j;
+    }
+    // the op output is read by the attention view and the scatter views only
+    return found == n_sr && ggml_cuda_fusion_use_count(cgraph, op) == 1 + n_sr;
+}
+
+// graph_optimize: move the q/k norms (and, for a single sequence, the state/ring gathers) right in front of the op
+static void ggml_cuda_gdn_replay_reorder(ggml_cgraph * cgraph, ggml_backend_graph_optimize_params * params) {
+    for (int oi = 0; oi < cgraph->n_nodes; ++oi) {
+        if (cgraph->nodes[oi]->op != GGML_OP_GATED_DELTA_NET_REPLAY) {
+            continue;
+        }
+        ggml_cuda_gdn_replay_match m;
+        m.op = cgraph->nodes[oi];
+        if (!ggml_cuda_gdn_replay_check(cgraph, m)) {
+            continue;
+        }
+        const int lo = std::max(0, oi - 128);
+        ggml_tensor * order[8] = { m.nq, m.sq, m.nk, m.sk, m.gs, m.rs, m.gr, m.rr };
+        int n_order = m.gs ? 8 : 4;
+        for (int o = 0; o < n_order; ++o) {
+            if (ggml_cuda_fusion_find_node(cgraph, order[o], lo, oi) < 0) {
+                n_order = o < 4 ? 0 : 4;
+                break;
+            }
+        }
+        if (n_order == 0) {
+            continue;
+        }
+        if (n_order == 8) {
+            // nothing between a gather and the op may write the cache rows it reads (zeroing, extra-cell copies)
+            const int ig = ggml_cuda_fusion_find_node(cgraph, m.gs, lo, oi);
+            const int ir = ggml_cuda_fusion_find_node(cgraph, m.gr, lo, oi);
+            if (ggml_cuda_fusion_written_between(cgraph, ggml_cuda_fusion_base(m.gs->src[0]), ig + 1, oi) ||
+                ggml_cuda_fusion_written_between(cgraph, ggml_cuda_fusion_base(m.gr->src[0]), ir + 1, oi)) {
+                n_order = 4;
+            }
+        }
+        if (ggml_cuda_fusion_written_between(cgraph, ggml_cuda_fusion_base(m.nq->src[0]), ggml_cuda_fusion_find_node(cgraph, m.nq, lo, oi) + 1, oi) ||
+            ggml_cuda_fusion_written_between(cgraph, ggml_cuda_fusion_base(m.nk->src[0]), ggml_cuda_fusion_find_node(cgraph, m.nk, lo, oi) + 1, oi)) {
+            continue;
+        }
+        for (int o = 0; o < n_order; ++o) {
+            const int from = ggml_cuda_fusion_find_node(cgraph, order[o], lo, oi);
+            ggml_cuda_fusion_move_node(cgraph, from, oi - 1);
+        }
+        params->add_alloc_dep(params->user_data, m.nq->src[0], m.op);
+        params->add_alloc_dep(params->user_data, m.nk->src[0], m.op);
+    }
+}
+
+// graph_compute: nodes[i] is the q rms_norm of a group that is adjacent up to view/no-op nodes (e.g. views of the
+// packed row index input); returns the index of the last fused node or -1
+static int ggml_cuda_try_gdn_replay(ggml_backend_cuda_context & ctx, const ggml_cgraph * cgraph, int i) {
+    // the non-view nodes from i on, up to the op
+    int seq[9];
+    int n_seq = 0;
+    int oi    = -1;
+    for (int j = i; j < std::min(cgraph->n_nodes, i + 24) && n_seq < 9; ++j) {
+        const ggml_tensor * n = cgraph->nodes[j];
+        if (n->op == GGML_OP_GATED_DELTA_NET_REPLAY) {
+            oi = j;
+            break;
+        }
+        if (ggml_cuda_is_view_or_noop(n) && n->op != GGML_OP_RESHAPE) {
+            continue;
+        }
+        seq[n_seq++] = j;
+    }
+    if (oi < 0 || (n_seq != 4 && n_seq != 8)) {
+        return -1;
+    }
+    ggml_cuda_gdn_replay_match m;
+    m.op = cgraph->nodes[oi];
+    if (!ggml_cuda_gdn_replay_check(cgraph, m)) {
+        return -1;
+    }
+    if (cgraph->nodes[seq[0]] != m.nq || cgraph->nodes[seq[1]] != m.sq || cgraph->nodes[seq[2]] != m.nk || cgraph->nodes[seq[3]] != m.sk) {
+        return -1;
+    }
+    bool full = false;
+    if (n_seq == 8) {
+        // gathers inside the group: all of them fused, or no fusion
+        if (m.gs == nullptr || cgraph->nodes[seq[4]] != m.gs || cgraph->nodes[seq[5]] != m.rs ||
+            cgraph->nodes[seq[6]] != m.gr || cgraph->nodes[seq[7]] != m.rr || !ggml_cuda_gdn_replay_scatters(cgraph, oi, m)) {
+            return -1;
+        }
+        full = true;
+    }
+    const ggml_tensor * op = m.op;
+    const ggml_tensor * rq = m.nq->src[0];
+    const ggml_tensor * rk = m.nk->src[0];
+    // no aliasing between the op output and anything the kernel reads
+    const ggml_tensor * reads[7] = { rq, rk, op->src[2], op->src[3], op->src[4],
+                                     full ? m.gs->src[0] : op->src[5], full ? m.gr->src[0] : op->src[6] };
+    for (const ggml_tensor * r : reads) {
+        if (ggml_cuda_fusion_ranges_overlap(op, r)) {
+            return -1;
+        }
+    }
+
+    const ggml_tensor * v = op->src[2];
+    const int64_t S_v = v->ne[0], H = v->ne[1], n_tokens = v->ne[2], n_seqs = v->ne[3];
+    const int64_t D   = S_v * S_v * H;
+
+    ggml_cuda_gdn_replay_args a = {};
+    a.q = (const float *) rq->data; a.k = (const float *) rk->data;
+    a.sq1 = rq->nb[1] / sizeof(float); a.sq2 = rq->nb[2] / sizeof(float); a.sq3 = rq->nb[3] / sizeof(float);
+    a.qk_ne1 = rq->ne[1];
+    a.l2 = true;
+    a.eps_q   = ggml_get_op_params_f32(m.nq, 0);
+    a.scale_q = ggml_get_op_params_f32(m.sq, 0);
+    a.eps_k   = ggml_get_op_params_f32(m.nk, 0);
+    a.scale_k = ggml_get_op_params_f32(m.sk, 0);
+    a.v = (const float *) v->data;
+    a.sv1 = v->nb[1] / sizeof(float); a.sv2 = v->nb[2] / sizeof(float); a.sv3 = v->nb[3] / sizeof(float);
+    a.g = (const float *) op->src[3]->data; a.beta = (const float *) op->src[4]->data;
+    a.sb1 = op->src[4]->nb[1] / sizeof(float); a.sb2 = op->src[4]->nb[2] / sizeof(float); a.sb3 = op->src[4]->nb[3] / sizeof(float);
+    a.rep = (const int32_t *) op->src[7]->data;
+    a.R   = (int) op->src[6]->ne[1];
+    a.W   = ggml_get_op_params_i32(op, 0);
+    a.attn = (float *) op->data;
+    // the long path's scratch state: the state_out region of the op output when the state goes to the cache
+    ggml_cuda_pool_alloc<float> scratch(ctx.pool());
+    if (full) {
+        a.state = (const float *) m.gs->src[0]->data; a.state_rows = (const int32_t *) m.gs->src[1]->data;
+        a.state_row_stride = m.gs->src[0]->nb[1] / sizeof(float);
+        a.ring  = (const float *) m.gr->src[0]->data; a.ring_rows = (const int32_t *) m.gr->src[1]->data;
+        a.out   = (float *) m.sr[0]->src[2]->data; a.out_rows = (const int32_t *) m.sr[0]->src[1]->data;
+        a.out_row_stride = m.sr[0]->src[2]->nb[1] / sizeof(float);
+        a.scratch = a.attn + S_v * H * n_tokens * n_seqs;
+        if (m.sr[1]) {
+            a.ring_out = (float *) m.sr[1]->src[2]->data; a.ring_out_rows = (const int32_t *) m.sr[1]->src[1]->data;
+            if (m.sr[1]->src[2]->nb[1] != (size_t) op->src[6]->ne[0] * sizeof(float)) {
+                return -1;
+            }
+        }
+    } else {
+        a.state    = (const float *) op->src[5]->data;
+        a.ring     = (const float *) op->src[6]->data;
+        a.out      = a.attn + S_v * H * n_tokens * n_seqs;
+        a.ring_out = a.out + D * n_seqs;
+        if (n_tokens > 8) {
+            a.scratch = scratch.alloc(D * n_seqs);
+        }
+    }
+    if (!ggml_cuda_op_gated_delta_net_replay(ctx, op, a)) {
+        return -1;
+    }
+    return full ? m.last : oi;
+}
+
 // try and fuse nodes and return the number of nodes to skip
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
@@ -3995,6 +4328,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 #endif
             ggml_cuda_op_gated_delta_net_fused_cache(*cuda_ctx, node, fused_state_cpy);
             return nodes_to_skip;
+        }
+    }
+
+    // gated_delta_net_replay -> [nq, sq, nk, sk, (gs, rs, gr, rr), op, (views), set_rows state, (set_rows ring)]:
+    // the fused kernel reads the state/ring rows and writes the state and the new ring rows into the caches
+    if (node->op == GGML_OP_RMS_NORM) {
+        const int last = ggml_cuda_try_gdn_replay(*cuda_ctx, cgraph, i);
+        if (last > i) {
+#ifdef GGML_CUDA_DEBUG
+            GGML_LOG_INFO("%s: fused gated_delta_net_replay group for %s (skipped %d nodes)\n",
+                          __func__, node->name, last - i);
+#endif
+            return last - i;
         }
     }
 
@@ -5107,6 +5453,9 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
     };
 
     if (!disable_fusion) {
+        // graph reordering: bring the fused-kernel node groups adjacent
+        ggml_cuda_gdn_replay_reorder(cgraph, params);
+
         // add alloc deps for performance positive fusions. This may increase the overall compute buffer size.
         // TODO: consolidate fusion paths in graph_optimize and graph_compute
         ggml_cuda_set_device(cuda_ctx->device);
@@ -6194,6 +6543,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_GATED_DELTA_NET:
             return true;
+        case GGML_OP_GATED_DELTA_NET_REPLAY:
+            return ggml_cuda_gated_delta_net_replay_supported(op);
         case GGML_OP_DSV4_HC_COMB:
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32;

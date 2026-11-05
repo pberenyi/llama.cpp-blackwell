@@ -294,6 +294,19 @@ public:
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
 
+    // rollback by replay (llama_memory_recurrent::rs_replay): packed I32 row indices and views of it
+    ggml_tensor * rp_idx      = nullptr;
+    ggml_tensor * rp_s_src    = nullptr; // [n_seqs]         state source rows
+    ggml_tensor * rp_rep      = nullptr; // [2*n_seqs]       rows to replay, fold flag
+    ggml_tensor * rp_ring_src = nullptr; // [Cap*n_seqs]     ring source rows (pending rows first)
+    ggml_tensor * rp_s_dst    = nullptr; // [n_seqs]         state destination rows
+    ggml_tensor * rp_ring_dst = nullptr; // [n_tokens*n_seqs] ring rows of the new tokens (ubatches of <= W tokens)
+    ggml_tensor * rp_extra    = nullptr; // [n_rs - n_seqs]  source cells of the other cells in the range
+
+    // fill rp_idx / check that it can be reused
+    void set_input_replay(const llama_memory_recurrent_context * mctx_recr, const llama_ubatch * ubatch);
+    bool can_reuse_replay(const llama_memory_recurrent_context * mctx_recr, const llama_ubatch & ubatch) const;
+
     const llama_memory_recurrent_context * mctx;
 
     // used in view offsets, need to match for valid graph reuse

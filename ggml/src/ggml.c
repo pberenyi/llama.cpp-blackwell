@@ -1118,9 +1118,11 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 
     "ADD_GUMBEL",
+
+    "GATED_DELTA_NET_REPLAY",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1236,9 +1238,11 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 
     "add_gumbel(x,ids,p)",
+
+    "gated_delta_net_replay(q,k,v,g,beta,s,ring,rep)",
 };
 
-static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 103");
+static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -1815,6 +1819,14 @@ static struct ggml_tensor * ggml_new_tensor_impl(
     size_t data_size = ggml_row_size(type, ne[0]);
     for (int i = 1; i < n_dims; i++) {
         data_size *= ne[i];
+    }
+
+    if (view_src != NULL && data_size != 0 && data_size + view_offs > ggml_nbytes(view_src)) {
+        fprintf(stderr, "GGML_VIEW_FAIL: type=%d ne=[%lld %lld %lld %lld] data_size=%zu view_offs=%zu view_src_bytes=%zu view_src_name='%s'\n",
+                type,
+                ne[0], ne[1] > 1 ? ne[1] : 0, ne[2] > 1 ? ne[2] : 0, ne[3] > 1 ? ne[3] : 0,
+                data_size, view_offs, ggml_nbytes(view_src),
+                view_src->name);
     }
 
     GGML_ASSERT(view_src == NULL || data_size == 0 || data_size + view_offs <= ggml_nbytes(view_src));
@@ -6522,6 +6534,70 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_gated_delta_net_replay
+
+struct ggml_tensor * ggml_gated_delta_net_replay(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * ring,
+        struct ggml_tensor  * rep,
+        int32_t               W) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_are_same_stride(q, k));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    GGML_ASSERT(ggml_is_contiguous(ring));
+    GGML_ASSERT(ggml_is_contiguous(rep));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32 && state->type == GGML_TYPE_F32);
+    GGML_ASSERT(ring->type == GGML_TYPE_F32 && rep->type == GGML_TYPE_I32);
+
+    const int64_t S_k      = k->ne[0];
+    const int64_t H_k      = k->ne[1];
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    GGML_ASSERT(S_k == S_v && H % H_k == 0);
+    GGML_ASSERT(ggml_are_same_shape(q, k) && k->ne[2] == n_tokens && k->ne[3] == n_seqs);
+    GGML_ASSERT(g->ne[0] == 1 && g->ne[1] == H && g->ne[2] == n_tokens && g->ne[3] == n_seqs);
+    GGML_ASSERT(ggml_are_same_shape(g, beta));
+    GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H && state->ne[3] == n_seqs);
+    GGML_ASSERT(ring->ne[0] == S_k*H_k + S_v*H + 2*H && ring->ne[2] == n_seqs && ring->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(rep) == 2*n_seqs);
+    GGML_ASSERT(W >= 1);
+
+    const int64_t D    = S_v*S_v*H;
+    // always allocate at max size (W) so the graph shape is stable across decode/verify
+    const int64_t ne   = S_v*H*W*n_seqs + D*n_seqs + ring->ne[0]*W*n_seqs;
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne);
+
+    ggml_set_op_params_i32(result, 0, W);
+
+    result->op     = GGML_OP_GATED_DELTA_NET_REPLAY;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = ring;
+    result->src[7] = rep;
 
     return result;
 }

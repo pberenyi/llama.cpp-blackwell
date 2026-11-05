@@ -77,6 +77,18 @@ public:
     // per-seq rollback index
     std::vector<uint32_t> rs_idx;
 
+    // rollback by replay (delta-net models, n_rs_seq > 0): instead of 1 + n_rs_seq state snapshots, s_l keeps one state
+    // per cell (a "base") and q_l a circular buffer of rs_Cap rows per cell with the inputs of the tokens processed
+    // since that base (pending rows). A graph replays the pending rows, processes its tokens and appends their rows;
+    // the base is only rewritten ("fold": the replayed rows are folded into it) when the buffer would overflow, when
+    // the cell moves, and for ubatches of more than rs_W tokens (which store their final state and keep no rows).
+    // A rollback only drops pending rows (GGML_OP_GATED_DELTA_NET_REPLAY). The conv state (r_l) keeps its
+    // 1 + n_rs_seq snapshots (rs_idx).
+    bool     rs_replay = false;
+    uint32_t rs_W      = 0; // longest ubatch (tokens per sequence) whose rows are kept (n_rs_seq + 1)
+    uint32_t rs_Cap    = 0; // ring rows per cell
+    int64_t  rs_F      = 0; // ring row size (floats)
+
     void set_rs_idx(llama_seq_id seq_id, uint32_t idx);
 
     // computed before each graph build
@@ -91,6 +103,15 @@ public:
         int32_t   src  = -1; // used to know where states should be copied from
         int32_t   src0 = -1; // like src, but only used when setting the inputs (allowing to copy once)
         int32_t   tail = -1;
+
+        // rollback by replay (rs_replay): first pending ring row, number of pending rows, rows appended by the last
+        // ubatch (the most that a rollback can drop)
+        uint32_t  off    = 0;
+        uint32_t  cnt    = 0;
+        uint32_t  last_n = 0;
+        uint32_t  off0   = 0; // like src0: the values before the current ubatch and its fold decision, for the inputs
+        uint32_t  cnt0   = 0;
+        uint32_t  fold0  = 0;
 
         // largest rollback whose snapshot the last ubatch guarantees: a ubatch of n <= n_rs_seq + 1 tokens
         // writes snapshots 0..n-1, a longer one only guarantees the final state (ggml_gated_delta_net)
@@ -118,6 +139,8 @@ public:
     std::vector<ggml_tensor *> s_l;
     // a second conv history that must stay replicated across devices, so it cannot share the r row
     std::vector<ggml_tensor *> p_l;
+    // ring of replay inputs (rs_replay)
+    std::vector<ggml_tensor *> q_l;
 
 private:
     //const llama_model & model;
@@ -138,7 +161,11 @@ private:
     size_t size_p_bytes() const;
 
     void state_write_meta(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges, llama_seq_id seq_id = -1) const;
-    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges) const;
+    // cell_ranges: rows of r_l; cell_ranges_s: rows of s_l (default: the same); reps: per written cell, the ring row of
+    // its first pending row (cell*rs_Cap + off) and the number of pending rows (rs_replay)
+    void state_write_data(llama_io_write_i & io, const std::vector<std::pair<uint32_t, uint32_t>> & cell_ranges,
+                          const std::vector<std::pair<uint32_t, uint32_t>> * cell_ranges_s = nullptr,
+                          const std::vector<std::pair<uint32_t, uint32_t>> * reps = nullptr) const;
 
     bool state_read_meta(llama_io_read_i & io, uint32_t cell_count, llama_seq_id dest_seq_id = -1);
     bool state_read_data(llama_io_read_i & io, uint32_t cell_count);
@@ -184,8 +211,21 @@ public:
     ggml_tensor * get_r_l(int32_t il) const;
     ggml_tensor * get_s_l(int32_t il) const;
     ggml_tensor * get_p_l(int32_t il) const;
+    ggml_tensor * get_q_l(int32_t il) const;
 
     int32_t s_copy(int i) const;
+
+    // rollback by replay
+    bool     is_rs_replay() const;
+    uint32_t get_rs_W()     const;
+    uint32_t get_rs_Cap()   const;
+    int64_t  get_rs_F()     const;
+
+    // number of I32 values of the replay index input for a ubatch
+    int64_t rs_replay_n_idx(uint32_t n_seqs, uint32_t n_seq_tokens) const;
+    // layout: [s_src n_seqs | rep 2*n_seqs (count, fold) | ring_src Cap*n_seqs | s_dst n_seqs |
+    //          ring_dst n_seq_tokens*n_seqs if n_seq_tokens <= W | extra (n_rs - n_seqs)]
+    void set_input_rs_replay(int32_t * data, uint32_t n_seqs, uint32_t n_seq_tokens) const;
 
 private:
     const llama_memory_status status;

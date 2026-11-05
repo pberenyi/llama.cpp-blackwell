@@ -160,3 +160,12 @@ Cmake*
 /tools/ui
 .ninja*
 *.tcl
+*.vcxproj
+*.vcxproj.filters
+*.slnx
+*.filters
+*.tlog
+*.recipe
+tests\*.vcxproj
+objects.txt
+Debug\
