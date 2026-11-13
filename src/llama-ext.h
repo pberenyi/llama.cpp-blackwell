@@ -123,6 +123,30 @@ LLAMA_API std::vector<ggml_backend_buffer_t> llama_memory_get_buffers(const llam
 // Useful for testing purposes.
 LLAMA_API void llama_model_set_attn_rot(struct llama_model * model, bool value);
 
+// Set whether the context outputs nextn embeddings or not
+// If masked == true,  output the embeddings only for the tokens with batch.logits != 0
+// If masked == false, output the embeddings for all tokens in the batch regardless of batch.logits
+LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool value, bool masked);
+
+// Select which appended NextN block the DECODER_MTP graph runs (offset past
+// the trunk: il = n_layer() + offset). Used by the speculative NextN driver to
+// chain multiple trained NextN heads. Default 0 (first head).
+LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t offset);
+
+// Set the draft-noise (coupled sampling) parameters for the MTP draft graph.
+// When temp > 0, the MTP graph inserts a ggml_add_gumbel node so the drafter
+// proposes argmax(logit + temp * ggml_gumbel_noise(seed, k + j, id)) for the j-th
+// draft token. The target's coupled sampler uses the same (seed, k) for its own
+// draw, so drafts match the target's sample more often at temp > 0.
+// Set temp = 0 to disable (the node is removed from the graph).
+LLAMA_API void llama_mtp_set_draft_noise(
+        struct llama_context * ctx,
+        uint32_t seed,
+        uint32_t k,
+        float    temp,
+        int32_t  top_k,
+        float    top_p);
+
 // Marks the entries that a decision head (clef, vllm-decision2) reads, the default is 0
 // See https://github.com/ggml-org/llama.cpp/pull/29831 for details
 // A run of entries with the same value is one span, spans must be separated by entries with value 0

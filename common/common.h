@@ -300,6 +300,10 @@ struct common_params_sampling {
 
     bool backend_sampling = false;
 
+    // replace the final random draw (dist) with a Gumbel-max draw that uses counter-based noise, so that a speculative
+    // drafter can add the same noise to its own logits (see common_sampler_get_coupled). Same output distribution.
+    bool coupled = false;
+
     // print the parameters into a string
     std::string print() const;
 };

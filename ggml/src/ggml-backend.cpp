@@ -2342,6 +2342,19 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
 
+    if (sched->context_buffer == NULL) {
+        fprintf(stderr,
+                "ggml_backend_sched_new: context buffer allocation failed: "
+                "graph_size=%zu, splits=%zu, bytes=%zu\n",
+                graph_size,
+                ggml_sched_max_splits,
+                sched->context_buffer_size);
+        GGML_ABORT("failed to allocate scheduler context buffer");
+    }
+
+    GGML_ASSERT(sched->context_buffer != NULL &&
+                "failed to allocate scheduler context buffer");
+
     const int initial_splits_capacity = 16;
     sched->splits = (ggml_backend_sched_split *) calloc(initial_splits_capacity, sizeof(sched->splits[0]));
     sched->splits_capacity = initial_splits_capacity;

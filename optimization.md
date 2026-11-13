@@ -278,7 +278,79 @@ stock build) if:
 | Date | Phase | Status | Notes |
 |------|-------|--------|-------|
 | 2026-11-02 | — | Plan created | Tree verified: q4i8 FA, Gumbel absent; MTP engine + qwen35 models + Blackwell MMQ present |
-| | 0 | pending | |
-| | 1 | pending | |
-| | 2 | pending | |
-| | 3 | pending | |
+| | 0 | ✅ Done | Stock baseline: ~79.6–81.1 tok/s (PDL off/on), 512-token benchmark protocol established |
+| | 1 | ✅ Done | `fattn-mma-q4i8.cu/.cuh` + `gumbel.cu/.cuh` copied and wired into `ggml-cuda.cu` / CMakeLists; compiles |
+| | 2 | ⚠️ Partial | GDN short-sequence verify kernel ported. **Coupled sampling sampler + MTP draft noise NOT ported** (see §12) |
+| | 3 | ✅ Done | `rs_replay` in `llama-memory-recurrent.cpp` working; replay path +0.94 tok/s vs snapshot (81.05 vs 80.11), byte-identical output, ~420 MiB VRAM saved, +13k context |
+| | — | ✅ Done | GDN replay fusion (019 patch): 7 helpers + 4 replay functions + `ggml_cuda_try_gdn_replay` in `ggml-cuda.cu`; eliminated 8-node get/set_rows group per layer; recovered the full ~2 tok/s launch-overhead cost of replay |
+| | 4 | ⏭️ Skipped | Model graphs already in tree |
+| | 7 | ⏭️ Skipped | mmvq/mmvf/mmq GEMM micro-opts — MSVC C2672, as planned |
+
+**Current state (post-port):** replay + fusion + PDL on = 81.05 tok/s (15679 MiB peak).
+GPU idle floor is ~14–16% (structural: ~100 kernel launches/cycle + inter-graph CPU
+gaps); not addressable by GDN fusion alone.
+
+---
+
+## 12. Next: coupled sampling sampler + MTP draft noise (TODO)
+
+The Gumbel CUDA kernel (`gumbel.cu`) is already in the tree and wired. What is
+missing is the **host-side coupled-sampling machinery** that makes the MTP
+drafter propose the same tokens the target would sample at temperature > 0.
+This is the highest-value remaining item — it targets draft acceptance
+(~0.72 → ~0.85+ per the feveromo recipe), directly improving the
+~2.43 mean accepted tokens/cycle.
+
+### 12.1 `common_sampler_coupled` in `common/sampling.cpp`
+
+- New final sampler: replaces `llama_sampler_init_dist` with a Gumbel-max
+  draw using counter-based noise (`ggml_gumbel_noise(seed, k, token)`).
+- Sampling decision: `argmax(logit + temp * gumbel_noise)` — deterministic
+  given `(seed, k, temp)`, reproducible on the draft side without shared RNG
+  state.
+- Expose parameters (`seed`, `k0`, `temp`, `top_k`, `top_p`) via a getter
+  (see 12.4).
+
+### 12.2 `--spec-coupled-sampling` CLI arg in `common/arg.cpp`
+
+- New flag (and `common.h` field) enabling the coupled sampler in the
+  sampling chain when spec decoding is active.
+- Must be a **final** sampler (applied last in the chain).
+
+### 12.3 `llama_mtp_set_draft_noise` API
+
+- `llama_mtp_set_draft_noise(ctx, seed, k0, temp, top_k, top_p)` in
+  `llama-context.cpp` / `llama-graph.cpp`.
+- Plumbs the Gumbel noise parameters into the MTP draft graph so the
+  drafter proposes `argmax(logit + temp * ggml_gumbel_noise(seed, k+j, token))`
+  for its j draft positions.
+- `llama-ext.h` staging API already present — confirm the new entry fits the
+  existing pattern (no new header surface needed beyond the function).
+
+### 12.4 `common_sampler_get_coupled` helper
+
+- In `common/sampling.cpp` / used by `common/speculative.cpp`: reads the
+  coupled sampler's parameters from the active chain so
+  `common_speculative_impl_draft_mtp` can pass them to the MTP drafter
+  each step (k0 must advance with the generation counter).
+
+### 12.5 Build + gate
+
+- Build clean under MSVC/Ninja.
+- Smoke test: `--spec-type draft-mtp --spec-coupled-sampling` at temp > 0 —
+  no crashes, output coherent.
+- **Benchmark gate:** mean accepted tokens/cycle must rise measurably from
+  ~2.43 (watch the server's spec stats); tok/s @ 8K with the standard
+  512-token protocol.
+- Commit as: `feat: port coupled (Gumbel) sampling sampler + MTP draft noise`.
+
+### 12.6 Out of scope / already resolved (do not re-investigate)
+
+- `n_rs=1` "anomaly" — not a bug (`get_n_rs()` returns `mem->n` = 1 for
+  single-seq).
+- `--cache-ram 0` + ~8 GB RSS — model mmap'd from disk; fixed with
+  `--load-mode none`. KV cache fully in VRAM.
+- 110 graph reallocs per 30k run — cosmetic (<0.1%); real fix requires
+  fixed-`n_ctx` attention mask, not worth kernel changes.
+- q8-cache / mmq / conv-state / gated-norm fusion paths from the 019 patch —
+  require unported 017/018 host infrastructure; intentionally not ported.

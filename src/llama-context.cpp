@@ -779,6 +779,7 @@ void llama_context::sched_new(const sched_params & params) {
     sched.reset(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), params.max_nodes, params.parallel, params.op_offload));
 
+    LLAMA_LOG_INFO("sched_new: max_nodes=%zu, parallel=%d\n", max_nodes, parallel);
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 
@@ -1684,6 +1685,25 @@ bool llama_context::supports_state_row() const {
 
 void llama_context::set_nextn_layer_offset(int32_t offset) {
     cparams.nextn_layer_offset = offset;
+}
+
+void llama_context::set_draft_noise(uint32_t seed, uint32_t k, float temp, int32_t top_k, float top_p) {
+    if (draft_noise_seed   == seed &&
+        draft_noise_k      == k &&
+        draft_noise_temp   == temp &&
+        draft_noise_top_k  == top_k &&
+        draft_noise_top_p  == top_p) {
+        return;
+    }
+
+    draft_noise_seed  = seed;
+    draft_noise_k     = k;
+    draft_noise_temp  = temp;
+    draft_noise_top_k = top_k;
+    draft_noise_top_p = top_p;
+
+    // the gumbel node changes the graph topology (present/absent), so force a rebuild
+    gf_res_prev_active = nullptr;
 }
 
 void llama_context::set_causal_attn(bool value) {
@@ -3096,6 +3116,12 @@ llm_graph_params llama_context::graph_params(
         /*.h_nextn_src   =*/ supports_state_row() ? cparams.ctx_state_src->get_h_nextn_dev() : nullptr,
         /*.samplers    =*/ sampling.samplers,
         /*.n_outputs   =*/ n_outputs,
+        /*.draft_noise_seed  =*/ draft_noise_seed,
+        /*.draft_noise_k     =*/ draft_noise_k,
+        /*.draft_noise_temp  =*/ draft_noise_temp,
+        /*.draft_noise_top_k =*/ draft_noise_top_k,
+        /*.draft_noise_top_p =*/ draft_noise_top_p,
+        /*.n_vocab           =*/ model.vocab.n_tokens(),
         /*.cb          =*/ graph_get_cb(),
         /*.res         =*/ res,
     };
@@ -4754,6 +4780,19 @@ void llama_set_embeddings_layer_inp(llama_context * ctx, uint32_t lid, bool valu
 
 void llama_set_nextn_layer_offset(llama_context * ctx, int32_t offset) {
     ctx->set_nextn_layer_offset(offset);
+}
+
+void llama_mtp_set_draft_noise(
+        struct llama_context * ctx,
+        uint32_t seed,
+        uint32_t k,
+        float    temp,
+        int32_t  top_k,
+        float    top_p) {
+    if (ctx == nullptr) {
+        return;
+    }
+    ctx->set_draft_noise(seed, k, temp, top_k, top_p);
 }
 
 llama_memory_t llama_get_memory(const struct llama_context * ctx) {

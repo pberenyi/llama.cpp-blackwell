@@ -79,6 +79,15 @@ struct common_speculative_draft_params {
     // the target's temp and seed, read only when the drafter samples probabilistically
     float    temp = 1.0f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+
+    // coupled sampling (Gumbel-max) params from the target's sampler;
+    // when coupled_temp > 0 the MTP drafter inserts a ggml_add_gumbel node
+    // so it proposes argmax(logit + coupled_temp * gumbel(coupled_seed, coupled_k + j, id))
+    float    coupled_temp  = 0.0f;
+    uint32_t coupled_seed  = 0;
+    uint32_t coupled_k     = 0;
+    int32_t  coupled_top_k = 0;
+    float    coupled_top_p = 1.0f;
 };
 
 common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);

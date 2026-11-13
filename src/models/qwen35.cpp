@@ -678,6 +678,11 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llm_graph_params & params)
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
     cur = build_lora_mm(head_w, cur, head_s);
+
+    // coupled sampling: when draft noise is active, add the same Gumbel noise as the target's
+    // coupled final sampler, so the drafter proposes argmax(logit + temp * noise(seed, k + j, id))
+    // for draft token j (row j, k_off = 0)
+    cur = build_draft_noise(cur, nullptr, 0);
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

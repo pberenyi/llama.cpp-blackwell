@@ -1866,6 +1866,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 dp.result_q = nullptr;
             }
 
+            // coupled sampling: push the target's Gumbel noise params into the MTP graph so
+            // the drafter proposes argmax(logit + temp * gumbel(seed, k + j, id)) — the same
+            // noise the target's coupled sampler uses, making drafts match more often
+            if (dp.coupled_temp > 0.0f) {
+                llama_mtp_set_draft_noise(ctx_dft, dp.coupled_seed, dp.coupled_k, dp.coupled_temp, dp.coupled_top_k, dp.coupled_top_p);
+            } else {
+                llama_mtp_set_draft_noise(ctx_dft, 0, 0, 0.0f, 0, 1.0f);
+            }
+
             // result_q is only set when the caller wants rejection, so it also gates the retune
             if (dp.result_q) {
                 spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp, dp.seed);

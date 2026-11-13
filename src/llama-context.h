@@ -139,6 +139,9 @@ struct llama_context {
     void set_nextn_layer_offset(int32_t offset);
     void set_causal_attn(bool value);
 
+    // draft-noise (coupled sampling) for the MTP draft graph
+    void set_draft_noise(uint32_t seed, uint32_t k, float temp, int32_t top_k, float top_p);
+
     void set_adapters_lora(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
 
     bool adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales);
@@ -342,6 +345,13 @@ private:
     llama_adapter_loras_ptr loras;
 
     llama_cross cross; // TODO: tmp for handling cross-attention - need something better probably
+
+    // draft-noise (coupled sampling) parameters for the MTP graph
+    uint32_t draft_noise_seed   = 0;
+    uint32_t draft_noise_k      = 0;
+    float    draft_noise_temp   = 0.0f;
+    int32_t  draft_noise_top_k  = 0;
+    float    draft_noise_top_p  = 1.0f;
 
     llama_memory_ptr memory;
     llama_moe_cache_ptr moe_cache;

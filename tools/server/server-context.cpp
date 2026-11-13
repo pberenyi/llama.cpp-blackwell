@@ -3908,16 +3908,26 @@ private:
 
                         const bool spec_reject = slot.use_spec_rejection();
 
+                        // coupled sampling: read the target's coupled sampler state (seed, k, temp,
+                        // top_k, top_p) so the MTP drafter can add the same Gumbel noise to its logits
+                        common_sampler_coupled_params cp;
+                        const bool coupled = common_sampler_get_coupled(slot.smpl.get(), cp);
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
-                            /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
-                            /* .pos0     = */ slot.prompt.tokens.pos_next(),
-                            /* .id_last  = */ slot.sampled,
-                            /* .prompt   = */ &slot.spec_prompt,
-                            /* .result   = */ &slot.spec_draft,
-                            /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
-                            /* .temp     = */ slot.task->params.sampling.temp,
-                            /* .seed     = */ slot.task->params.sampling.seed,
+                            /* .drafting      = */ true,
+                            /* .n_max         = */ n_draft_max,
+                            /* .pos0          = */ slot.prompt.tokens.pos_next(),
+                            /* .id_last       = */ slot.sampled,
+                            /* .prompt        = */ &slot.spec_prompt,
+                            /* .result        = */ &slot.spec_draft,
+                            /* .result_q      = */ spec_reject ? &slot.spec_draft_q : nullptr,
+                            /* .temp          = */ slot.task->params.sampling.temp,
+                            /* .seed          = */ slot.task->params.sampling.seed,
+                            /* .coupled_temp  = */ coupled ? cp.temp : 0.0f,
+                            /* .coupled_seed  = */ coupled ? cp.seed : 0,
+                            /* .coupled_k     = */ coupled ? cp.k    : 0,
+                            /* .coupled_top_k = */ coupled ? cp.top_k : 0,
+                            /* .coupled_top_p = */ coupled ? cp.top_p : 1.0f,
                         };
 
                         drafting.push_back(&slot);

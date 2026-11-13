@@ -398,6 +398,43 @@ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_draft_noise::set_input(const llama_ubatch * /*ubatch*/) {
+    GGML_ASSERT(p);
+    GGML_ASSERT(ids);
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(p->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(ids->buffer));
+
+    int32_t * data = (int32_t *) p->data;
+
+    data[0] = (int32_t) seed;
+    data[1] = (int32_t) k;
+    memcpy(&data[2], &temp, sizeof(float));
+    data[3] = (int32_t) n_vocab; // n_valid: keep the whole row
+    data[4] = top_k;
+    memcpy(&data[5], &top_p, sizeof(float));
+
+    // the token ids are the vocab order of the LM head (i = token id); they never change
+    if (ggml_nbytes(ids) > 0) {
+        int32_t * ids_data = (int32_t *) ids->data;
+        for (int64_t i = 0; i < ids->ne[0]; ++i) {
+            ids_data[i] = (int32_t) i;
+        }
+    }
+}
+
+bool llm_graph_input_draft_noise::can_reuse(const llm_graph_params & params) {
+    bool res = true;
+
+    res &= n_vocab == params.n_vocab;
+
+    // note: the actual noise values (seed, k, temp, top_k, top_p) are data, not topology -
+    //       when they change, llama_context::set_draft_noise() forces a graph rebuild
+    (void) params;
+
+    return res;
+}
+
 void llm_graph_input_mean::set_input(const llama_ubatch * ubatch) {
     if (cparams.embeddings   &&
        (cparams.pooling_type == LLAMA_POOLING_TYPE_MEAN ||
@@ -1623,6 +1660,12 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     layer_inp_src    (params.layer_inp_src),
     h_nextn_dev      (params.h_nextn_dev),
     h_nextn_src      (params.h_nextn_src),
+    draft_noise_seed (params.draft_noise_seed),
+    draft_noise_k    (params.draft_noise_k),
+    draft_noise_temp (params.draft_noise_temp),
+    draft_noise_top_k(params.draft_noise_top_k),
+    draft_noise_top_p(params.draft_noise_top_p),
+    n_vocab          (params.n_vocab),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2927,6 +2970,35 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
     ggml_set_name(cur, "out_ids");
 
     res->add_input(std::move(inp));
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_draft_noise(
+        ggml_tensor * cur, ggml_tensor * /*ids*/, int32_t k_off) const {
+    if (draft_noise_temp <= 0.0f) {
+        return cur;
+    }
+
+    auto inp = std::make_unique<llm_graph_input_draft_noise>(hparams, cparams,
+            draft_noise_seed, draft_noise_k, draft_noise_temp,
+            draft_noise_top_k, draft_noise_top_p, n_vocab);
+
+    inp->p = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 6);
+    ggml_set_input(inp->p);
+    ggml_set_name(inp->p, "draft_noise_params");
+
+    inp->ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) n_vocab);
+    ggml_set_input(inp->ids);
+    ggml_set_name(inp->ids, "draft_noise_ids");
+
+    ggml_tensor * params = inp->p;
+    ggml_tensor * ids    = inp->ids;
+
+    res->add_input(std::move(inp));
+
+    cur = ggml_add_gumbel(ctx0, cur, ids, params, k_off);
+    cb(cur, "draft_noise", -1);
 
     return cur;
 }
