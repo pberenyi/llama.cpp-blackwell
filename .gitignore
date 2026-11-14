@@ -153,3 +153,19 @@ a.out.*
 
 AGENTS.local.md
 .pi/SYSTEM.md
+
+Cmake*
+*.cmake
+*.exp
+/tools/ui
+.ninja*
+*.tcl
+*.vcxproj
+*.vcxproj.filters
+*.slnx
+*.filters
+*.tlog
+*.recipe
+tests\*.vcxproj
+objects.txt
+Debug\

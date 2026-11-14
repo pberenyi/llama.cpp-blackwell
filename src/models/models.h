@@ -57,6 +57,7 @@ struct llm_build_delta_net_base : public llm_graph_context {
 
     // run delta-net attention and write the new recurrent state(s) back to ssm_states_all
     // s: (head_v_dim, head_v_dim, num_v_heads, n_seqs); returns output: (head_v_dim, num_v_heads, n_seq_tokens, n_seqs)
+    // ring: with rollback by replay (inp->rp_idx), the gathered ring rows from build_rs_replay
     ggml_tensor * build_recurrent_attn(
             llm_graph_input_rs * inp,
             ggml_tensor *        ssm_states_all,
@@ -66,6 +67,15 @@ struct llm_build_delta_net_base : public llm_graph_context {
             ggml_tensor *        g,
             ggml_tensor *        b,
             ggml_tensor *        s,
+            int                  il,
+            ggml_tensor *        ring = nullptr);
+
+    // rollback by replay (inp->rp_idx != nullptr): zero the row new sequences start from, gather the initial states
+    // [n_embd_s, n_seqs] and the ring rows [F, Cap, n_seqs] (pending rows first) of the ubatch sequences, and move the
+    // states and ring buffers of the other cells in the range (like build_rs)
+    std::pair<ggml_tensor *, ggml_tensor *> build_rs_replay(
+            llm_graph_input_rs * inp,
+            ggml_tensor *        ssm_states_all,
             int                  il);
 };
 

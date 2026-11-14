@@ -429,6 +429,10 @@ extern "C" {
 
         GGML_OP_GLU,
 
+        GGML_OP_ADD_GUMBEL,
+
+        GGML_OP_GATED_DELTA_NET_REPLAY,
+
         GGML_OP_COUNT,
     };
 
@@ -886,6 +890,24 @@ extern "C" {
     GGML_API struct ggml_tensor * ggml_argmax(
             struct ggml_context * ctx,
             struct ggml_tensor  * a);
+
+    // Gumbel-max sampling on the device: add counter-based noise (the same values on every backend and in
+    // ggml_gumbel_noise) to the kept elements of each row of a, like top-k/top-p sampling:
+    //   out[i0, i1] = a[i0, i1] + t*ggml_gumbel_noise(seed, (uint32_t) (k + k_off + i1), ids[i0])  if i0 is kept, else -INFINITY
+    // a: F32 [n, m], ids: I32 or F32 (integer values, e.g. token ids) [n], p: I32 [6] = { seed, k, t, n_valid, top_k, top_p }
+    // (t and top_p as F32 bits). Only the first n_valid elements of a row can be kept (n_valid <= 0: all). top_k > 0 keeps
+    // the elements >= the top_k-th largest one (all of them if there are more than 128), and then, if top_p < 1, the
+    // smallest prefix of those (by value) whose softmax reaches top_p. t = 0: out = a.
+    // The argmax of a row of out is a sample of softmax(a/t) over the kept elements.
+    GGML_API struct ggml_tensor * ggml_add_gumbel(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * ids,
+            struct ggml_tensor  * p,
+            int32_t               k_off);
+
+    // Gumbel noise -log(-log(u)) with u in (0, 1) from a hash of (seed, ctr, id), 52 random bits
+    GGML_API float ggml_gumbel_noise(uint32_t seed, uint64_t ctr, int32_t id);
 
     // count number of equal elements in a and b
     GGML_API struct ggml_tensor * ggml_count_equal(
@@ -2430,6 +2452,31 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // gated delta net (scalar gate) that first replays up to R buffered tokens, for recurrent-state rollback by replay
+    // (speculative decoding keeps a base state plus the inputs of the tokens after it instead of per-token snapshots):
+    //   q, k, v, g (scalar), beta : as for ggml_gated_delta_net
+    //   state : F32 [S_v, S_v, H_v, n_rs, n_seqs] -- all ring positions; rp_s_src selects the position (row group)
+    //           of the base state, as a runtime op param (stable graph shape across ring positions)
+    //   ring  : F32 [F, R, n_seqs], F = S_k*H_k + S_v*H_v + 2*H_v -- one row per buffered token, as consumed by the
+    //           recurrence: k [S_k, H_k] (normalized), v [S_v, H_v], g [H_v] (before exp), beta [H_v]
+    //   rep   : I32 [2, n_seqs] -- rep[0, s]: number of ring rows (0..R) replayed from `state` before the new tokens,
+    //           rep[1, s]: fold flag
+    // the result is 1-D F32: [ attn [S_v, H_v, n_tokens, n_seqs] | state_out [S_v*S_v*H_v, n_seqs] | ring_new ]
+    //   n_tokens > W : state_out = the final state, ring_new is empty
+    //   otherwise    : state_out = the state after the replay (fold) or the input state (no fold), and
+    //                  ring_new = [F, n_tokens, n_seqs], the ring rows of the new tokens
+    GGML_API struct ggml_tensor * ggml_gated_delta_net_replay(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * g,
+            struct ggml_tensor  * beta,
+            struct ggml_tensor  * state,
+            struct ggml_tensor  * ring,
+            struct ggml_tensor  * rep,
+            int32_t               W);
 
     // DSA lightning indexer
     //

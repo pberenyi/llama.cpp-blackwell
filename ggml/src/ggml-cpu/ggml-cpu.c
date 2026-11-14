@@ -1838,6 +1838,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_argmax(params, tensor);
             } break;
+        case GGML_OP_ADD_GUMBEL:
+            {
+                ggml_compute_forward_add_gumbel(params, tensor);
+            } break;
         case GGML_OP_COUNT_EQUAL:
             {
                 ggml_compute_forward_count_equal(params, tensor);
@@ -2290,6 +2294,7 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_SUM_ROWS:
         case GGML_OP_MEAN:
         case GGML_OP_ARGMAX:
+        case GGML_OP_ADD_GUMBEL:
             {
                 n_tasks = 1;
             } break;

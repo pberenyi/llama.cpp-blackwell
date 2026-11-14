@@ -76,6 +76,50 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
     return conv_input;
 }
 
+std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_rs_replay(
+        llm_graph_input_rs * inp,
+        ggml_tensor *        ssm_states_all,
+        int                  il) {
+    const auto * mctx_cur = inp->mctx;
+
+    const int64_t n_seqs = ubatch.n_seqs;
+    const int64_t n_rs   = mctx_cur->get_n_rs();
+    const int64_t size   = mctx_cur->get_size();
+    const int64_t head   = mctx_cur->get_head();
+    const int32_t rs_z   = mctx_cur->get_rs_z();
+    const int64_t Cap    = mctx_cur->get_rs_Cap();
+    const int64_t D      = hparams.n_embd_s();
+
+    ggml_tensor * ring_all = mctx_cur->get_q_l(il);
+    const int64_t F        = ring_all->ne[0];
+
+    GGML_ASSERT(ssm_states_all->ne[0] == D && ssm_states_all->ne[1] == size);
+
+    // a new sequence starts from the row of rs_z (zeroed; no cell reads it otherwise)
+    ggml_tensor * state_zero = ggml_view_1d(ctx0, ssm_states_all, D*(rs_z >= 0), rs_z*ssm_states_all->nb[1]*(rs_z >= 0));
+    ggml_build_forward_expand(gf, ggml_scale_inplace(ctx0, state_zero, 0));
+
+    // gathers first: the moves below may overwrite source rows
+    ggml_tensor * states = ggml_get_rows(ctx0, ssm_states_all, inp->rp_s_src);
+    ggml_build_forward_expand(gf, states);
+
+    ggml_tensor * ring = ggml_get_rows(ctx0, ring_all, inp->rp_ring_src);
+    ring = ggml_reshape_3d(ctx0, ring, F, Cap, n_seqs);
+    ggml_build_forward_expand(gf, ring);
+
+    if (n_rs > n_seqs) {
+        // the other cells in the range move with their state and their whole ring buffer
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_get_rows(ctx0, ssm_states_all, inp->rp_extra),
+            ggml_view_2d(ctx0, ssm_states_all, D, n_rs - n_seqs, ssm_states_all->nb[1], (head + n_seqs)*ssm_states_all->nb[1])));
+
+        ggml_tensor * ring_cells = ggml_reshape_2d(ctx0, ring_all, F*Cap, size);
+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, ggml_get_rows(ctx0, ring_cells, inp->rp_extra),
+            ggml_view_2d(ctx0, ring_cells, F*Cap, n_rs - n_seqs, ring_cells->nb[1], (head + n_seqs)*ring_cells->nb[1])));
+    }
+
+    return { states, ring };
+}
+
 ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         llm_graph_input_rs * inp,
         ggml_tensor *        ssm_states_all,
@@ -85,7 +129,8 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         ggml_tensor *        g,
         ggml_tensor *        b,
         ggml_tensor *        s,
-        int                  il) {
+        int                  il,
+        ggml_tensor *        ring) {
     const auto * mctx_cur   = inp->mctx;
     const auto   kv_head    = mctx_cur->get_head();
     const uint32_t mem_size = mctx_cur->get_size();
@@ -95,7 +140,45 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
     const int64_t n_seqs       = s->ne[3];
     const int64_t n_seq_tokens = q->ne[2];
 
-    const bool keep = cparams.n_rs_seq > 0;
+    const bool keep = cparams.n_rs_seq > 0 && ring == nullptr;
+
+    if (inp->rp_idx != nullptr && n_seq_tokens <= mctx_cur->get_rs_W()) {
+        // rollback by replay: one state per sequence plus the inputs of the tokens after it, instead of
+        // 1 + n_rs_seq snapshots
+        GGML_ASSERT(ring != nullptr);
+        ggml_tensor * ring_all = mctx_cur->get_q_l(il);
+
+        const int64_t W     = mctx_cur->get_rs_W();
+        const bool    chain = n_seq_tokens <= W;
+        const int64_t D     = S_v * S_v * H_v;
+        const int64_t F     = ring_all->ne[0];
+
+        ggml_tensor * out = ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, ring, inp->rp_rep, (int32_t) W);
+        if (n_seq_tokens > 1) {
+            res->add_fused_node({LLM_FUSED_OP_GDN_CH, out, il});
+        } else {
+            res->add_fused_node({LLM_FUSED_OP_GDN_AR, out, il});
+        }
+
+        const size_t es      = ggml_element_size(out);
+        const size_t off_fin = (size_t) (S_v * H_v * W * n_seqs) * es;
+
+        ggml_tensor * output = ggml_view_4d(ctx0, out, S_v, H_v, n_seq_tokens, n_seqs,
+            S_v * es, S_v * H_v * es, S_v * H_v * n_seq_tokens * es, 0);
+        cb(output, "attn_output", il);
+
+
+        ggml_tensor * state_out = ggml_view_2d(ctx0, out, D, n_seqs, D * es, off_fin);
+        ggml_build_forward_expand(gf, ggml_set_rows(ctx0, ssm_states_all, state_out, inp->rp_s_dst));
+
+        if (chain) {
+            ggml_tensor * rnew = ggml_view_2d(ctx0, out, F, n_seq_tokens * n_seqs, F * es, off_fin + D * n_seqs * es);
+            ggml_tensor * ring_dst = ggml_view_1d(ctx0, inp->rp_ring_dst, n_seq_tokens * n_seqs, 0);
+            ggml_build_forward_expand(gf, ggml_set_rows(ctx0, ring_all, rnew, ring_dst));
+        }
+
+        return output;
+    }
 
     if (!keep) {
         auto attn_out = build_delta_net(q, k, v, g, b, s);
