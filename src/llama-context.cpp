@@ -779,7 +779,7 @@ void llama_context::sched_new(const sched_params & params) {
     sched.reset(ggml_backend_sched_new(
             backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), params.max_nodes, params.parallel, params.op_offload));
 
-    LLAMA_LOG_INFO("sched_new: max_nodes=%zu, parallel=%d\n", max_nodes, parallel);
+    LLAMA_LOG_INFO("sched_new: max_nodes=%zu, parallel=%d\n", params.max_nodes, params.parallel);
     ggml_backend_sched_set_copy_callback(sched.get(), sched_copy_experts, this);
     ggml_backend_sched_set_realloc_callback(sched.get(), sched_graph_realloc, this);
 

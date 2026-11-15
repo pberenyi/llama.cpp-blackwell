@@ -154,11 +154,6 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
         const int64_t F     = ring_all->ne[0];
 
         ggml_tensor * out = ggml_gated_delta_net_replay(ctx0, q, k, v, g, b, s, ring, inp->rp_rep, (int32_t) W);
-        if (n_seq_tokens > 1) {
-            res->add_fused_node({LLM_FUSED_OP_GDN_CH, out, il});
-        } else {
-            res->add_fused_node({LLM_FUSED_OP_GDN_AR, out, il});
-        }
 
         const size_t es      = ggml_element_size(out);
         const size_t off_fin = (size_t) (S_v * H_v * W * n_seqs) * es;

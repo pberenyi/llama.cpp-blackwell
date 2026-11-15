@@ -3,6 +3,7 @@
 #include "common.h"
 #include "ggml.h"
 #include "ggml-cpp.h"
+#include "../src/llama-ext.h"
 #include "llama.h"
 #include "log.h"
 #include "ngram-cache.h"

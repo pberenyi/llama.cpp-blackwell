@@ -649,6 +649,7 @@ static __global__ void flash_attn_ext_q4i8(
         const char * mask,
         const char * sinks,
         const int  * KV_max,
+        const int  * KV_rows,
         float      * dst,
         float2     * dst_meta,
         const float scale,
@@ -667,6 +668,7 @@ static __global__ void flash_attn_ext_q4i8(
     ggml_cuda_pdl_sync();
 #if defined(FLASH_ATTN_AVAILABLE) && defined(BLACKWELL_MMA_AVAILABLE)
     constexpr int nbatch_fa = Q4I8_NBATCH;
+    GGML_UNUSED(KV_rows);
 
     const int gqa_ratio = ne02 / ne12;
 
@@ -734,7 +736,7 @@ static __global__ void flash_attn_ext_q4i8(
 
     tile(std::false_type{}, std::true_type{}); // Last index writes its data to fixup buffer to avoid data races with other blocks.
 #else
-    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, dst, dst_meta, scale,
+    GGML_UNUSED_VARS(Q, K, V, mask, sinks, KV_max, KV_rows, dst, dst_meta, scale,
         max_bias, m0, m1, n_head_log2, logit_softcap,
         ne00, ne01, ne02, ne03,
               nb01, nb02, nb03,
@@ -775,6 +777,7 @@ bool ggml_cuda_flash_attn_ext_mma_q4i8_supported(const int device, const ggml_te
     const ggml_tensor * V     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
+    const ggml_tensor * kv_rows = dst->src[5];
 
     // Only tested on consumer Blackwell (sm_120), the device code is only compiled for that architecture family.
     if (!GGML_CUDA_CC_IS_NVIDIA(cc) || cc < GGML_CUDA_CC_BLACKWELL || cc >= GGML_CUDA_CC_RUBIN ||
@@ -783,7 +786,7 @@ bool ggml_cuda_flash_attn_ext_mma_q4i8_supported(const int device, const ggml_te
     }
 
     // Large batches only, small batches are latency bound and handled by the other kernels.
-    if (Q->ne[1] < 64 || Q->ne[0] != Q4I8_D || sinks || !mask || mask->ne[2] != 1 || (uintptr_t) Q->data % 16 != 0) {
+    if (Q->ne[1] < 64 || Q->ne[0] != Q4I8_D || sinks || kv_rows || !mask || mask->ne[2] != 1 || (uintptr_t) Q->data % 16 != 0) {
         return false;
     }
 
