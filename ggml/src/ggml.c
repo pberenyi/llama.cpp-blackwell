@@ -1118,11 +1118,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GATED_DELTA_NET_REPLAY",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
-
     "x",
     "x+y",
     "x[i]+y",
@@ -1150,11 +1149,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rms_norm_back(x)",
     "group_norm(x)",
     "l2_norm(x)",
-
     "X*Y",
     "X[i]*Y",
     "X*Y",
-
     "x*v",
     "y-\\>view(x)",
     "x-\\>y",
@@ -1195,7 +1192,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "leaky_relu(x)",
     "tri(x)",
     "fill(x, c)",
-
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
     "ssm_conv(x)",
@@ -1214,28 +1210,21 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
-
     "unary(x)",
-
     "map_custom(x)",
     "map_custom(x,y)",
     "map_custom(x,y,z)",
-
     "custom(x)",
-
     "cross_entropy_loss(x,y)",
     "cross_entropy_loss_back(x,y)",
     "adamw(x)",
     "sgd(x)",
-
     "glu(x)",
-
     "add_gumbel(x,ids,p)",
-
     "gated_delta_net_replay(q,k,v,g,beta,s,ring,rep)",
 };
 
-static_assert(GGML_OP_COUNT == 104, "GGML_OP_COUNT != 104");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
