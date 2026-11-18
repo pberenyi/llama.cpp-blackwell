@@ -268,6 +268,23 @@ public:
     const uint32_t n_outputs;
 };
 
+// parameters of the ggml_add_gumbel node (draft-noise for coupled sampling)
+// note: the values change on every draft cycle (k advances), so the graph is
+//       rebuilt each cycle (see llama_context::set_draft_noise); set_input just
+//       refreshes the tensor data with the values captured at build time
+class llm_graph_input_draft_noise : public llm_graph_input_i {
+public:
+    llm_graph_input_draft_noise(
+            const llama_hparams & hparams,
+            const llama_cparams & cparams,
+            uint32_t seed,
+            uint32_t k,
+            float    temp,
+            int32_t  top_k,
+            float    top_p,
+            uint32_t n_vocab)
+        : hparams(hparams), cparams(cparams), seed(seed), k(k), temp(temp), top_k(top_k), top_p(top_p), n_vocab(n_vocab) {}
+    virtual ~llm_graph_input_draft_noise() = default;
 // random expert ids for the MoE GEMMs, for benchmarks only (env: LLAMA_MOE_RANDOM_ROUTING)
 class llm_graph_input_moe_ids : public llm_graph_input_i {
 public:
@@ -278,6 +295,18 @@ public:
 
     bool can_reuse(const llm_graph_params & params) override;
 
+    ggml_tensor * p;   // I32 [6]: { seed, k, t, n_valid, top_k, top_p }, t/top_p bit-cast to i32
+    ggml_tensor * ids; // I32 [n_vocab]: token ids in the vocab order of the LM head
+
+    const llama_hparams hparams;
+    const llama_cparams cparams;
+
+    const uint32_t seed;
+    const uint32_t k;
+    const float    temp;
+    const int32_t  top_k;
+    const float    top_p;
+    const uint32_t n_vocab;
     ggml_tensor * ids = nullptr; // I32 [n_expert_used_max, n_tokens]
 
     const int64_t n_expert;
@@ -323,6 +352,19 @@ public:
     // and shared across layers which use build_rs
     ggml_tensor * s_copy_main; // I32 [n_seqs]
     ggml_tensor * s_copy_tail; // I32 [n_rs - 1]
+
+    // rollback by replay (llama_memory_recurrent::rs_replay): packed I32 row indices and views of it
+    ggml_tensor * rp_idx      = nullptr;
+    ggml_tensor * rp_s_src    = nullptr; // [n_seqs]         state source rows
+    ggml_tensor * rp_rep      = nullptr; // [2*n_seqs]       rows to replay, fold flag
+    ggml_tensor * rp_ring_src = nullptr; // [Cap*n_seqs]     ring source rows (pending rows first)
+    ggml_tensor * rp_s_dst    = nullptr; // [n_seqs]         state destination rows
+    ggml_tensor * rp_ring_dst = nullptr; // [n_tokens*n_seqs] ring rows of the new tokens (ubatches of <= W tokens)
+    ggml_tensor * rp_extra    = nullptr; // [n_rs - n_seqs]  source cells of the other cells in the range
+
+    // fill rp_idx / check that it can be reused
+    void set_input_replay(const llama_memory_recurrent_context * mctx_recr, const llama_ubatch * ubatch);
+    bool can_reuse_replay(const llama_memory_recurrent_context * mctx_recr, const llama_ubatch & ubatch) const;
 
     const llama_memory_recurrent_context * mctx;
 
@@ -848,6 +890,15 @@ struct llm_graph_params {
 
     uint32_t n_outputs;
 
+    // draft-noise (coupled sampling): when temp > 0, the MTP graph inserts a ggml_add_gumbel node
+    // so the drafter proposes argmax(logit + temp * ggml_gumbel_noise(seed, k + j, id))
+    uint32_t draft_noise_seed   = 0;
+    uint32_t draft_noise_k      = 0;
+    float    draft_noise_temp   = 0.0f;
+    int32_t  draft_noise_top_k  = 0;
+    float    draft_noise_top_p  = 1.0f;
+    uint32_t n_vocab            = 0;
+
     llm_graph_cb cb;
 
     llm_graph_result * res;
@@ -913,6 +964,11 @@ struct llm_graph_params {
 
         // TODO: https://github.com/ggml-org/llama.cpp/pull/24340#discussion_r3448035248
         if (cparams.nextn_layer_offset != other.cparams.nextn_layer_offset) {
+            return false;
+        }
+
+        // the gumbel node changes the graph topology (noise values are data, not topology)
+        if ((draft_noise_temp > 0.0f) != (other.draft_noise_temp > 0.0f)) {
             return false;
         }
 
@@ -1105,6 +1161,14 @@ struct llm_graph_context {
     ggml_tensor * h_nextn_dev;
     ggml_tensor * h_nextn_src;
 
+    // draft-noise (coupled sampling): the MTP graph inserts a ggml_add_gumbel node when temp > 0
+    const uint32_t draft_noise_seed;
+    const uint32_t draft_noise_k;
+    const float    draft_noise_temp;
+    const int32_t  draft_noise_top_k;
+    const float    draft_noise_top_p;
+    const uint32_t n_vocab;
+
     std::map<llama_seq_id, llama_sampler *> samplers;
 
     const llm_graph_cb & cb_func;
@@ -1285,6 +1349,11 @@ struct llm_graph_context {
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
     ggml_tensor * build_inp_moe_ids(int64_t n_used, int64_t n_rows) const;
+
+    // draft-noise (coupled sampling): when draft_noise_temp > 0, insert a ggml_add_gumbel node on top of "cur"
+    // so the drafter proposes argmax_i(cur[i] + draft_noise_temp * ggml_gumbel_noise(seed, k + k_off + row, id))
+    // "ids" must be a [n_vocab] I32 tensor of token ids (the vocab order of the LM head)
+    ggml_tensor * build_draft_noise(ggml_tensor * cur, ggml_tensor * ids, int32_t k_off) const;
 
     ggml_tensor * build_inp_cross_embd() const;
     ggml_tensor * build_inp_pos_bucket_enc() const;

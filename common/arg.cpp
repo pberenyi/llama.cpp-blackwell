@@ -4290,6 +4290,16 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_SAMPLING"));
     add_opt(common_arg(
+        {"--spec-coupled-sampling"},
+        {"--no-spec-coupled-sampling"},
+        string_format("use Gumbel-max coupled sampling so the MTP drafter can add the same noise to its logits "
+                      "(requires temp > 0; default: %s)",
+                      params.sampling.coupled ? "enabled" : "disabled"),
+        [](common_params & params, bool value) {
+            params.sampling.coupled = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_COUPLED_SAMPLING"));
+    add_opt(common_arg(
         {"--spec-draft-device", "-devd", "--device-draft"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading the draft model (none = don't offload, default: follows --device)\n"
         "use --list-devices to see a list of available devices",

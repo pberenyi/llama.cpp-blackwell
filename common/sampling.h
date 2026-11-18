@@ -93,6 +93,24 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
+// coupled sampling (params.coupled): the final draw of the chain is argmax_i(logit_i + ggml_gumbel_noise(seed, k, id_i))
+// over the remaining candidates, k = number of tokens accepted since the last reset (the draw after k accepts).
+// A drafter that proposes argmax_i(draft_logit_i/temp + ggml_gumbel_noise(seed, k + j, id_i)) over the candidates that
+// top_k/top_p keep for the j-th draft token matches the sample more often.
+struct common_sampler_coupled_params {
+    float    temp  = 0.0f; // 0: not coupled or greedy
+    uint32_t seed  = 0;
+    uint32_t k     = 0;    // k of the next draw
+    int32_t  top_k = 0;    // truncation of the chain (0 = none, else at most 128)
+    float    top_p = 1.0f;
+};
+
+// returns false (and temp = 0) if the sampler does not use coupled sampling or samples greedily (temp <= 0)
+bool common_sampler_get_coupled(const struct common_sampler * gsmpl, common_sampler_coupled_params & out);
+
+// the final sampler used for params.coupled (a replacement for llama_sampler_init_dist)
+struct llama_sampler * common_sampler_init_coupled(uint32_t seed);
+
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl);
 

@@ -1112,13 +1112,16 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "ADD_GUMBEL",
+
+    "GATED_DELTA_NET_REPLAY",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
-
     "x",
     "x+y",
     "x[i]+y",
@@ -1146,11 +1149,9 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "rms_norm_back(x)",
     "group_norm(x)",
     "l2_norm(x)",
-
     "X*Y",
     "X[i]*Y",
     "X*Y",
-
     "x*v",
     "y-\\>view(x)",
     "x-\\>y",
@@ -1191,7 +1192,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "leaky_relu(x)",
     "tri(x)",
     "fill(x, c)",
-
     "flash_attn_ext(x)",
     "flash_attn_back(x)",
     "ssm_conv(x)",
@@ -1210,24 +1210,21 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
     "top_k_mask(mask, top_k, score, blocks, extra)",
-
     "unary(x)",
-
     "map_custom(x)",
     "map_custom(x,y)",
     "map_custom(x,y,z)",
-
     "custom(x)",
-
     "cross_entropy_loss(x,y)",
     "cross_entropy_loss_back(x,y)",
     "adamw(x)",
     "sgd(x)",
-
     "glu(x)",
+    "add_gumbel(x,ids,p)",
+    "gated_delta_net_replay(q,k,v,g,beta,s,ring,rep)",
 };
 
-static_assert(GGML_OP_COUNT == 99, "GGML_OP_COUNT != 99");
+static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -2533,6 +2530,48 @@ struct ggml_tensor * ggml_argmax(
 
     result->op     = GGML_OP_ARGMAX;
     result->src[0] = a;
+
+    return result;
+}
+
+// ggml_add_gumbel
+
+static inline uint64_t ggml_gumbel_mix64(uint64_t z) {
+    // splitmix64 finalizer
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
+}
+
+float ggml_gumbel_noise(uint32_t seed, uint64_t ctr, int32_t id) {
+    // keep in sync with ggml-cuda/gumbel.cu
+    const uint64_t key = ggml_gumbel_mix64(ggml_gumbel_mix64((uint64_t) seed + 0x9e3779b97f4a7c15ULL) ^ ctr);
+    const uint64_t r   = ggml_gumbel_mix64(key + ((uint64_t) (uint32_t) id + 1)*0x9e3779b97f4a7c15ULL);
+
+    const double u = ((double) (r >> 12) + 0.5)*0x1p-52; // exact, in (0, 1)
+
+    return (float) -log(-log(u));
+}
+
+struct ggml_tensor * ggml_add_gumbel(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        struct ggml_tensor  * ids,
+        struct ggml_tensor  * p,
+        int32_t               k_off) {
+    GGML_ASSERT(a->type == GGML_TYPE_F32 && ggml_is_matrix(a) && a->nb[0] == sizeof(float));
+    GGML_ASSERT(ids->type == GGML_TYPE_I32 || ids->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_vector(ids) && ggml_is_contiguous(ids) && ids->ne[0] == a->ne[0]);
+    GGML_ASSERT(p->type == GGML_TYPE_I32 && ggml_is_contiguous(p) && ggml_nelements(p) == 6);
+
+    struct ggml_tensor * result = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, a->ne[0], a->ne[1]);
+
+    ggml_set_op_params_i32(result, 0, k_off);
+
+    result->op     = GGML_OP_ADD_GUMBEL;
+    result->src[0] = a;
+    result->src[1] = ids;
+    result->src[2] = p;
 
     return result;
 }
@@ -6351,6 +6390,70 @@ struct ggml_tensor * ggml_gated_delta_net(
     result->src[3] = g;
     result->src[4] = beta;
     result->src[5] = state;
+
+    return result;
+}
+
+// ggml_gated_delta_net_replay
+
+struct ggml_tensor * ggml_gated_delta_net_replay(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * g,
+        struct ggml_tensor  * beta,
+        struct ggml_tensor  * state,
+        struct ggml_tensor  * ring,
+        struct ggml_tensor  * rep,
+        int32_t               W) {
+    GGML_ASSERT(ggml_is_contiguous_rows(q));
+    GGML_ASSERT(ggml_is_contiguous_rows(k));
+    GGML_ASSERT(ggml_is_contiguous_rows(v));
+    GGML_ASSERT(ggml_are_same_stride(q, k));
+    GGML_ASSERT(ggml_is_contiguous(g));
+    GGML_ASSERT(ggml_is_contiguous(beta));
+    GGML_ASSERT(ggml_is_contiguous(state));
+    GGML_ASSERT(ggml_is_contiguous(ring));
+    GGML_ASSERT(ggml_is_contiguous(rep));
+
+    GGML_ASSERT(q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32);
+    GGML_ASSERT(g->type == GGML_TYPE_F32 && beta->type == GGML_TYPE_F32 && state->type == GGML_TYPE_F32);
+    GGML_ASSERT(ring->type == GGML_TYPE_F32 && rep->type == GGML_TYPE_I32);
+
+    const int64_t S_k      = k->ne[0];
+    const int64_t H_k      = k->ne[1];
+    const int64_t S_v      = v->ne[0];
+    const int64_t H        = v->ne[1];
+    const int64_t n_tokens = v->ne[2];
+    const int64_t n_seqs   = v->ne[3];
+
+    GGML_ASSERT(S_k == S_v && H % H_k == 0);
+    GGML_ASSERT(ggml_are_same_shape(q, k) && k->ne[2] == n_tokens && k->ne[3] == n_seqs);
+    GGML_ASSERT(g->ne[0] == 1 && g->ne[1] == H && g->ne[2] == n_tokens && g->ne[3] == n_seqs);
+    GGML_ASSERT(ggml_are_same_shape(g, beta));
+    GGML_ASSERT(state->ne[0] == S_v && state->ne[1] == S_v && state->ne[2] == H && state->ne[3] == n_seqs);
+    GGML_ASSERT(ring->ne[0] == S_k*H_k + S_v*H + 2*H && ring->ne[2] == n_seqs && ring->ne[3] == 1);
+    GGML_ASSERT(ggml_nelements(rep) == 2*n_seqs);
+    GGML_ASSERT(W >= 1);
+
+    const int64_t D    = S_v*S_v*H;
+    // always allocate at max size (W) so the graph shape is stable across decode/verify
+    const int64_t ne   = S_v*H*W*n_seqs + D*n_seqs + ring->ne[0]*W*n_seqs;
+
+    struct ggml_tensor * result = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, ne);
+
+    ggml_set_op_params_i32(result, 0, W);
+
+    result->op     = GGML_OP_GATED_DELTA_NET_REPLAY;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = g;
+    result->src[4] = beta;
+    result->src[5] = state;
+    result->src[6] = ring;
+    result->src[7] = rep;
 
     return result;
 }

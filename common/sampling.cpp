@@ -172,6 +172,126 @@ struct common_sampler {
     mutable int64_t t_total_us = 0;
 };
 
+// coupled sampling: Gumbel-max final draw with counter-based noise (see common_sampler_get_coupled)
+// the noise of each draw is new: k advances on every accept, and a second draw at the same k (grammar resampling)
+// uses another stream, so the result is an exact sample of softmax(logits) like the dist sampler
+
+struct common_sampler_coupled {
+    uint32_t seed;
+    uint32_t seed_cur;
+
+    uint32_t n_acc   = 0; // tokens accepted since reset = k of the next draw
+    uint32_t n_apply = 0; // draws at the current k
+};
+
+static uint32_t common_coupled_seed(uint32_t seed) {
+    if (seed == LLAMA_DEFAULT_SEED) {
+        return std::random_device{}();
+    }
+    return seed;
+}
+
+static const char * common_sampler_coupled_name(const struct llama_sampler * /*smpl*/) {
+    return "coupled";
+}
+
+static void common_sampler_coupled_accept(struct llama_sampler * smpl, llama_token /*token*/) {
+    auto * ctx = (common_sampler_coupled *) smpl->ctx;
+    ctx->n_acc++;
+    ctx->n_apply = 0;
+}
+
+static void common_sampler_coupled_apply(struct llama_sampler * smpl, llama_token_data_array * cur_p) {
+    auto * ctx = (common_sampler_coupled *) smpl->ctx;
+
+    if (cur_p->size == 0) {
+        cur_p->selected = -1;
+        return;
+    }
+
+    const uint64_t ctr = (uint64_t) ctx->n_acc | ((uint64_t) ctx->n_apply << 32);
+    ctx->n_apply++;
+
+    float max_l = -INFINITY;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        max_l = std::max(max_l, cur_p->data[i].logit);
+    }
+
+    // probabilities as in dist, selection by Gumbel-max
+    double sum  = 0.0;
+    size_t best = 0;
+    float  best_v = -INFINITY;
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        const float p = expf(cur_p->data[i].logit - max_l);
+        cur_p->data[i].p = p;
+        sum += p;
+
+        const float v = cur_p->data[i].logit + ggml_gumbel_noise(ctx->seed_cur, ctr, cur_p->data[i].id);
+        if (v > best_v) {
+            best_v = v;
+            best   = i;
+        }
+    }
+    for (size_t i = 0; i < cur_p->size; ++i) {
+        cur_p->data[i].p /= sum;
+    }
+
+    cur_p->selected = best;
+}
+
+static void common_sampler_coupled_reset(struct llama_sampler * smpl) {
+    auto * ctx = (common_sampler_coupled *) smpl->ctx;
+    ctx->seed_cur = common_coupled_seed(ctx->seed);
+    ctx->n_acc    = 0;
+    ctx->n_apply  = 0;
+}
+
+static struct llama_sampler * common_sampler_coupled_clone(const struct llama_sampler * smpl) {
+    const auto * ctx = (const common_sampler_coupled *) smpl->ctx;
+
+    auto * result = common_sampler_init_coupled(ctx->seed);
+    *(common_sampler_coupled *) result->ctx = *ctx;
+
+    return result;
+}
+
+static void common_sampler_coupled_free(struct llama_sampler * smpl) {
+    delete (common_sampler_coupled *) smpl->ctx;
+}
+
+static void common_sampler_coupled_copy_state(const struct llama_sampler * src, struct llama_sampler * dst) {
+    *(common_sampler_coupled *) dst->ctx = *(const common_sampler_coupled *) src->ctx;
+}
+
+static struct llama_sampler_i common_sampler_coupled_i = {
+    /* .name              = */ common_sampler_coupled_name,
+    /* .accept            = */ common_sampler_coupled_accept,
+    /* .apply             = */ common_sampler_coupled_apply,
+    /* .reset             = */ common_sampler_coupled_reset,
+    /* .clone             = */ common_sampler_coupled_clone,
+    /* .free              = */ common_sampler_coupled_free,
+    /* .backend_init      = */ nullptr,
+    /* .backend_accept    = */ nullptr,
+    /* .backend_apply     = */ nullptr,
+    /* .backend_set_input = */ nullptr,
+    /* .backend_reset     = */ nullptr,
+    /* .copy_state        = */ common_sampler_coupled_copy_state,
+};
+
+struct llama_sampler * common_sampler_init_coupled(uint32_t seed) {
+    return llama_sampler_init(&common_sampler_coupled_i, new common_sampler_coupled { seed, common_coupled_seed(seed) });
+}
+
+static const common_sampler_coupled * common_sampler_find_coupled(const struct llama_sampler * chain) {
+    for (int i = 0; i < llama_sampler_chain_n(chain); ++i) {
+        const llama_sampler * smpl = llama_sampler_chain_get(const_cast<llama_sampler *>(chain), i);
+        if (smpl->iface == &common_sampler_coupled_i) {
+            return (const common_sampler_coupled *) smpl->ctx;
+        }
+    }
+    return nullptr;
+}
+
 std::string common_params_sampling::print() const {
     char result[1024];
 
@@ -406,6 +526,8 @@ struct common_sampler * common_sampler_init(
         if (use_adaptive_p) {
             // only if user explicitly included adaptive-p sampler
             samplers.push_back(llama_sampler_init_adaptive_p(params.adaptive_target, params.adaptive_decay, params.seed));
+        } else if (params.coupled) {
+            samplers.push_back(common_sampler_init_coupled(params.seed));
         } else {
             // Keep distribution sampling when callers request probabilities.
             const bool greedy = params.n_probs == 0 && !params.samplers.empty() &&
@@ -435,6 +557,12 @@ struct common_sampler * common_sampler_init(
 
     if (rbudget && params.backend_sampling) {
         LOG_WRN("%s: backend sampling is not compatible with reasoning budget, disabling\n", __func__);
+
+        params.backend_sampling = false;
+    }
+
+    if (params.coupled && params.backend_sampling) {
+        LOG_WRN("%s: backend sampling is not compatible with coupled sampling, disabling\n", __func__);
 
         params.backend_sampling = false;
     }
@@ -858,6 +986,32 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
+}
+
+bool common_sampler_get_coupled(const struct common_sampler * gsmpl, common_sampler_coupled_params & out) {
+    if (!gsmpl) {
+        out.temp = 0.0f;
+        return false;
+    }
+
+    const common_sampler_coupled * ctx = common_sampler_find_coupled(gsmpl->chain);
+    if (!ctx) {
+        out.temp = 0.0f;
+        return false;
+    }
+
+    // greedy (temp == 0) is not coupled: the drafter would propose argmax with no noise
+    if (gsmpl->params.temp <= 0.0f) {
+        out.temp = 0.0f;
+        return false;
+    }
+
+    out.temp    = gsmpl->params.temp;
+    out.seed    = ctx->seed_cur;
+    out.k       = ctx->n_acc;
+    out.top_k   = gsmpl->params.top_k;
+    out.top_p   = gsmpl->params.top_p;
+    return true;
 }
 
 bool common_sampler_reasoning_budget_force(struct common_sampler * gsmpl) {

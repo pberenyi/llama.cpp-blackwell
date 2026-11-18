@@ -399,6 +399,39 @@ bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {
     return res;
 }
 
+void llm_graph_input_draft_noise::set_input(const llama_ubatch * /*ubatch*/) {
+    GGML_ASSERT(p);
+    GGML_ASSERT(ids);
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(p->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(ids->buffer));
+
+    int32_t * data = (int32_t *) p->data;
+
+    data[0] = (int32_t) seed;
+    data[1] = (int32_t) k;
+    memcpy(&data[2], &temp, sizeof(float));
+    data[3] = (int32_t) n_vocab; // n_valid: keep the whole row
+    data[4] = top_k;
+    memcpy(&data[5], &top_p, sizeof(float));
+
+    // the token ids are the vocab order of the LM head (i = token id); they never change
+    if (ggml_nbytes(ids) > 0) {
+        int32_t * ids_data = (int32_t *) ids->data;
+        for (int64_t i = 0; i < ids->ne[0]; ++i) {
+            ids_data[i] = (int32_t) i;
+        }
+    }
+}
+
+bool llm_graph_input_draft_noise::can_reuse(const llm_graph_params & params) {
+    bool res = true;
+
+    res &= n_vocab == params.n_vocab;
+
+    // note: the actual noise values (seed, k, temp, top_k, top_p) are data, not topology -
+    //       when they change, llama_context::set_draft_noise() forces a graph rebuild
+    (void) params;
 void llm_graph_input_moe_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ggml_backend_buffer_is_host(ids->buffer));
 
@@ -525,8 +558,24 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
     }
 }
 
+void llm_graph_input_rs::set_input_replay(const llama_memory_recurrent_context * mctx_recr, const llama_ubatch * ubatch) {
+    if (rp_idx) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(rp_idx->buffer));
+        GGML_ASSERT(ggml_nelements(rp_idx) == mctx_recr->rs_replay_n_idx(ubatch->n_seqs, mctx_recr->get_rs_W()));
+        int32_t * data = (int32_t *) rp_idx->data;
+        mctx_recr->set_input_rs_replay(data, ubatch->n_seqs, ubatch->n_tokens / ubatch->n_seqs);
+    }
+}
+
+bool llm_graph_input_rs::can_reuse_replay(const llama_memory_recurrent_context * mctx_recr, const llama_ubatch & ubatch) const {
+    if ((rp_idx != nullptr) != mctx_recr->is_rs_replay()) {
+        return false;
+    }
+    return rp_idx == nullptr || rp_idx->ne[0] == mctx_recr->rs_replay_n_idx(ubatch.n_seqs, mctx_recr->get_rs_W());
+}
+
 void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
-    GGML_UNUSED(ubatch);
+    set_input_replay(mctx, ubatch);
 
     const int64_t n_rs = mctx->get_n_rs();
 
@@ -554,6 +603,8 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
 
     res &= head == mctx->get_head();
     res &= rs_z == mctx->get_rs_z();
+
+    res &= can_reuse_replay(mctx, params.ubatch);
 
     return res;
 }
@@ -1242,6 +1293,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
     // kv_rows and the mask stay unallocated if all attention layers have their own (e.g. qwen4exp QSA)
     mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
 
+    inp_rs->set_input_replay(mctx->get_recr(), ubatch);
+
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
     if (inp_rs->s_copy) {
@@ -1273,6 +1326,7 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_replay(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1287,6 +1341,8 @@ void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     if (inp_attn->self_attn_mask.raw->buffer) {
         mctx->get_attn()->set_input_attn_mask(inp_attn->self_attn_mask, ubatch, cparams.causal_attn);
     }
+
+    inp_rs->set_input_replay(mctx->get_recr(), ubatch);
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -1318,6 +1374,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_replay(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1344,6 +1401,8 @@ void llm_graph_input_mem_hybrid_iswa::set_input(const llama_ubatch * ubatch) {
     if (inp_attn->self_attn_mask_swa.raw && inp_attn->self_attn_mask_swa.raw->buffer) {
         attn_ctx->get_swa()->set_input_attn_mask(inp_attn->self_attn_mask_swa, ubatch, cparams.causal_attn);
     }
+
+    inp_rs->set_input_replay(mctx->get_recr(), ubatch);
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -1389,6 +1448,7 @@ bool llm_graph_input_mem_hybrid_iswa::can_reuse(const llm_graph_params & params)
 
     res &= inp_rs->head == mctx->get_recr()->get_head();
     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+    res &= inp_rs->can_reuse_replay(mctx->get_recr(), params.ubatch);
 
     return res;
 }
@@ -1629,6 +1689,12 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     layer_inp_src    (params.layer_inp_src),
     h_nextn_dev      (params.h_nextn_dev),
     h_nextn_src      (params.h_nextn_src),
+    draft_noise_seed (params.draft_noise_seed),
+    draft_noise_k    (params.draft_noise_k),
+    draft_noise_temp (params.draft_noise_temp),
+    draft_noise_top_k(params.draft_noise_top_k),
+    draft_noise_top_p(params.draft_noise_top_p),
+    n_vocab          (params.n_vocab),
     samplers         (params.samplers),
     cb_func          (params.cb),
     res              (params.res),
@@ -2953,6 +3019,35 @@ ggml_tensor * llm_graph_context::build_inp_out_ids() const {
     return cur;
 }
 
+ggml_tensor * llm_graph_context::build_draft_noise(
+        ggml_tensor * cur, ggml_tensor * /*ids*/, int32_t k_off) const {
+    if (draft_noise_temp <= 0.0f) {
+        return cur;
+    }
+
+    auto inp = std::make_unique<llm_graph_input_draft_noise>(hparams, cparams,
+            draft_noise_seed, draft_noise_k, draft_noise_temp,
+            draft_noise_top_k, draft_noise_top_p, n_vocab);
+
+    inp->p = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 6);
+    ggml_set_input(inp->p);
+    ggml_set_name(inp->p, "draft_noise_params");
+
+    inp->ids = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, (int64_t) n_vocab);
+    ggml_set_input(inp->ids);
+    ggml_set_name(inp->ids, "draft_noise_ids");
+
+    ggml_tensor * params = inp->p;
+    ggml_tensor * ids    = inp->ids;
+
+    res->add_input(std::move(inp));
+
+    cur = ggml_add_gumbel(ctx0, cur, ids, params, k_off);
+    cb(cur, "draft_noise", -1);
+
+    return cur;
+}
+
 ggml_tensor * llm_graph_context::build_inp_mean() const {
     auto inp = std::make_unique<llm_graph_input_mean>(cparams);
 
@@ -4131,6 +4226,8 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
     const int64_t n_rs   = mctx_cur->get_n_rs();
     const int64_t n_seqs = ubatch.n_seqs;
 
+
+
     inp->s_copy = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_rs);
     ggml_set_input(inp->s_copy);
     ggml_set_name(inp->s_copy, "rs_s_copy");
@@ -4140,6 +4237,30 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
 
     inp->head = mctx_cur->get_head();
     inp->rs_z = mctx_cur->get_rs_z();
+
+    if (mctx_cur->is_rs_replay()) {
+        const int64_t Cap = mctx_cur->get_rs_Cap();
+        const int64_t W   = mctx_cur->get_rs_W();
+
+        // always the max size (n_seq_tokens = W) so the graph shape does not depend on the token count
+        inp->rp_idx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, mctx_cur->rs_replay_n_idx(n_seqs, W));
+        ggml_set_input(inp->rp_idx);
+        ggml_set_name(inp->rp_idx, "rs_replay_idx");
+
+        const size_t es = ggml_element_size(inp->rp_idx);
+        int64_t off = 0;
+        auto view = [&](int64_t n) {
+            ggml_tensor * t = ggml_view_1d(ctx0, inp->rp_idx, n, off*es);
+            off += n;
+            return t;
+        };
+        inp->rp_s_src    = view(n_seqs);
+        inp->rp_rep      = view(2*n_seqs);
+        inp->rp_ring_src = view(Cap*n_seqs);
+        inp->rp_s_dst    = view(n_seqs);
+        inp->rp_ring_dst = view(W*n_seqs);
+        inp->rp_extra    = view(n_rs - n_seqs);
+    }
 
     return inp;
 }
