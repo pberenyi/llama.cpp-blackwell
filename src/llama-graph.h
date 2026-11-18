@@ -285,6 +285,11 @@ public:
             uint32_t n_vocab)
         : hparams(hparams), cparams(cparams), seed(seed), k(k), temp(temp), top_k(top_k), top_p(top_p), n_vocab(n_vocab) {}
     virtual ~llm_graph_input_draft_noise() = default;
+// random expert ids for the MoE GEMMs, for benchmarks only (env: LLAMA_MOE_RANDOM_ROUTING)
+class llm_graph_input_moe_ids : public llm_graph_input_i {
+public:
+    llm_graph_input_moe_ids(int64_t n_expert) : n_expert(n_expert) {}
+    virtual ~llm_graph_input_moe_ids() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
 
@@ -302,6 +307,9 @@ public:
     const int32_t  top_k;
     const float    top_p;
     const uint32_t n_vocab;
+    ggml_tensor * ids = nullptr; // I32 [n_expert_used_max, n_tokens]
+
+    const int64_t n_expert;
 };
 
 class llm_graph_input_mean : public llm_graph_input_i {
@@ -1049,6 +1057,9 @@ public:
 
     std::vector<ggml_tensor *> t_sampling_all;
 
+    // [0] is the LLAMA_MOE_RANDOM_ROUTING input, the rest are views of it
+    std::vector<ggml_tensor *> t_moe_ids;
+
     std::vector<llm_graph_input_ptr> inputs;
     std::vector<llm_graph_fused_node> fused_nodes;
 
@@ -1337,6 +1348,7 @@ struct llm_graph_context {
     ggml_tensor * build_inp_out_ids() const;
     ggml_tensor * build_inp_mean() const;
     ggml_tensor * build_inp_cls() const;
+    ggml_tensor * build_inp_moe_ids(int64_t n_used, int64_t n_rows) const;
 
     // draft-noise (coupled sampling): when draft_noise_temp > 0, insert a ggml_add_gumbel node on top of "cur"
     // so the drafter proposes argmax_i(cur[i] + draft_noise_temp * ggml_gumbel_noise(seed, k + k_off + row, id))
@@ -1463,7 +1475,8 @@ struct llm_graph_context {
             ggml_tensor * sinks, // [n_head_q]
             ggml_tensor * v_mla, // [n_embd_head_v_mla, n_embd_head_v, n_head_v]
                   float   kq_scale,
-                    int   il) const;
+                    int   il,
+            ggml_tensor * kq_mask = nullptr) const;
 
     llm_graph_input_attn_k_iswa * build_attn_inp_k_iswa() const;
 
