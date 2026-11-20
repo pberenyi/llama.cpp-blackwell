@@ -285,18 +285,13 @@ public:
             uint32_t n_vocab)
         : hparams(hparams), cparams(cparams), seed(seed), k(k), temp(temp), top_k(top_k), top_p(top_p), n_vocab(n_vocab) {}
     virtual ~llm_graph_input_draft_noise() = default;
-// random expert ids for the MoE GEMMs, for benchmarks only (env: LLAMA_MOE_RANDOM_ROUTING)
-class llm_graph_input_moe_ids : public llm_graph_input_i {
-public:
-    llm_graph_input_moe_ids(int64_t n_expert) : n_expert(n_expert) {}
-    virtual ~llm_graph_input_moe_ids() = default;
 
     void set_input(const llama_ubatch * ubatch) override;
 
     bool can_reuse(const llm_graph_params & params) override;
 
-    ggml_tensor * p;   // I32 [6]: { seed, k, t, n_valid, top_k, top_p }, t/top_p bit-cast to i32
-    ggml_tensor * ids; // I32 [n_vocab]: token ids in the vocab order of the LM head
+    ggml_tensor * p   = nullptr; // I32 [6]: { seed, k, t, n_valid, top_k, top_p }, t/top_p bit-cast to i32
+    ggml_tensor * ids = nullptr; // I32 [n_vocab]: token ids in the vocab order of the LM head (i = token id)
 
     const llama_hparams hparams;
     const llama_cparams cparams;
@@ -307,6 +302,18 @@ public:
     const int32_t  top_k;
     const float    top_p;
     const uint32_t n_vocab;
+};
+
+// random expert ids for the MoE GEMMs, for benchmarks only (env: LLAMA_MOE_RANDOM_ROUTING)
+class llm_graph_input_moe_ids : public llm_graph_input_i {
+public:
+    llm_graph_input_moe_ids(int64_t n_expert) : n_expert(n_expert) {}
+    virtual ~llm_graph_input_moe_ids() = default;
+
+    void set_input(const llama_ubatch * ubatch) override;
+
+    bool can_reuse(const llm_graph_params & params) override;
+
     ggml_tensor * ids = nullptr; // I32 [n_expert_used_max, n_tokens]
 
     const int64_t n_expert;

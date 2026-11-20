@@ -1711,6 +1711,11 @@ void llama_context::set_draft_noise(uint32_t seed, uint32_t k, float temp, int32
     draft_noise_top_k = top_k;
     draft_noise_top_p = top_p;
 
+    if (getenv("LLAMA_SPEC_COUPLED_LOG")) {
+        fprintf(stderr, "[mtp_draft_noise] seed=%u k=%u temp=%.2f top_k=%d top_p=%.2f rebuild=1\n",
+                seed, k, temp, top_k, top_p);
+    }
+
     // the gumbel node changes the graph topology (present/absent), so force a rebuild
     gf_res_prev_active = nullptr;
 }

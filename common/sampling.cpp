@@ -237,6 +237,11 @@ static void common_sampler_coupled_apply(struct llama_sampler * smpl, llama_toke
     }
 
     cur_p->selected = best;
+
+    if (getenv("LLAMA_SPEC_COUPLED_LOG")) {
+        fprintf(stderr, "[coupled_draw] seed=%u k=%u n_apply=%u token=%d\n",
+                ctx->seed_cur, ctx->n_acc, ctx->n_apply, (int) cur_p->data[best].id);
+    }
 }
 
 static void common_sampler_coupled_reset(struct llama_sampler * smpl) {

@@ -432,6 +432,10 @@ bool llm_graph_input_draft_noise::can_reuse(const llm_graph_params & params) {
     // note: the actual noise values (seed, k, temp, top_k, top_p) are data, not topology -
     //       when they change, llama_context::set_draft_noise() forces a graph rebuild
     (void) params;
+
+    return res;
+}
+
 void llm_graph_input_moe_ids::set_input(const llama_ubatch * ubatch) {
     GGML_ASSERT(ggml_backend_buffer_is_host(ids->buffer));
 

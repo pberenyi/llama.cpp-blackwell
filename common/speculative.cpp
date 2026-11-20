@@ -2143,6 +2143,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_mtp_set_draft_noise(ctx_dft, 0, 0, 0.0f, 0, 1.0f);
             }
 
+            if (getenv("LLAMA_SPEC_COUPLED_LOG")) {
+                fprintf(stderr, "[coupled_draft] seed=%u k=%u temp=%.2f top_k=%d\n",
+                        dp.coupled_seed, dp.coupled_k, dp.coupled_temp, dp.coupled_top_k);
+            }
+
             // result_q is only set when the caller wants rejection, so it also gates the retune
             if (dp.result_q) {
                 spec_retune(smpls, smpls_cfg, llama_get_model(ctx_dft), seq_id, dp.temp, dp.seed);
@@ -2289,6 +2294,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
+        }
+
+        if (getenv("LLAMA_SPEC_COUPLED_LOG")) {
+            fprintf(stderr, "[mtp_accept] n_accepted=%u\n", n_accepted);
         }
 
         const int32_t n_rows = verify_h_rows[seq_id];
