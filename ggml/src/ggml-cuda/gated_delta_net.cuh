@@ -12,3 +12,6 @@ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor *
 // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
 void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
                                               ggml_cuda_gated_delta_net_fused_cache cache);
+
+// replay kernel (Step 2: identical token loop to standard, no ring metadata yet)
+void ggml_cuda_op_gated_delta_net_replay(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
